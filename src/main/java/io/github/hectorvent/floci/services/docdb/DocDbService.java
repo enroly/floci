@@ -222,7 +222,16 @@ public class DocDbService {
     }
 
     public DocDbCluster getDbCluster(String id) {
-        String region = regionResolver.getRegion();
+        return getDbCluster(id, regionResolver.getRegion());
+    }
+
+    /**
+     * Looks up a cluster in an explicitly given region, for callers (e.g. secret target
+     * attachment resolution) that already know the correct region and must not fall back to
+     * {@link io.github.hectorvent.floci.core.common.RegionResolver#getRegion()}, which resolves
+     * to the configured default outside a request context (async/background work).
+     */
+    public DocDbCluster getDbCluster(String id, String region) {
         DocDbCluster cluster = findCluster(region, id).orElseThrow(() ->
                 new AwsException("DBClusterNotFoundFault",
                         "DocDB cluster " + id + " not found.", 404));
@@ -406,7 +415,16 @@ public class DocDbService {
     }
 
     public DocDbInstance getDbInstance(String id) {
-        String region = regionResolver.getRegion();
+        return getDbInstance(id, regionResolver.getRegion());
+    }
+
+    /**
+     * Looks up an instance in an explicitly given region, for callers (e.g. secret target
+     * attachment resolution) that already know the correct region and must not fall back to
+     * {@link io.github.hectorvent.floci.core.common.RegionResolver#getRegion()}, which resolves
+     * to the configured default outside a request context (async/background work).
+     */
+    public DocDbInstance getDbInstance(String id, String region) {
         DocDbInstance instance = findInstance(region, id).orElseThrow(() ->
                 new AwsException("DBInstanceNotFound",
                         "DocDB instance " + id + " not found.", 404));
