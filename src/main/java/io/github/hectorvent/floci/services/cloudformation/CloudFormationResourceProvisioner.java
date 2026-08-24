@@ -2875,7 +2875,7 @@ public class CloudFormationResourceProvisioner {
      */
     private static String resolvePolicyDocument(JsonNode props, CloudFormationTemplateEngine engine) {
         JsonNode documentNode = props != null ? props.get("PolicyDocument") : null;
-        String resolved = documentNode != null ? engine.resolveJsonAttribute(documentNode) : null;
+        String resolved = documentNode != null ? engine.resolveJsonAttributeStrict(documentNode) : null;
         return resolved != null ? resolved : "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
     }
 

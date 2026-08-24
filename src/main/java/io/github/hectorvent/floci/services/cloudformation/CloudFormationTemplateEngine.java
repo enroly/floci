@@ -36,6 +36,14 @@ public class CloudFormationTemplateEngine {
     private final Map<String, JsonNode> mappings;
     private final ObjectMapper objectMapper;
     private final Function<String, String> importValueResolver;
+    /**
+     * Every intrinsic this engine could not resolve, in the order it hit them. Both fallbacks
+     * ({@link #resolveRef} and {@link #resolveGetAttParts}) return a string built from the name
+     * they failed to look up, which is indistinguishable from a real value to any caller that only
+     * checks for null or empty. Recording them lets {@link #resolveJsonAttributeStrict} refuse that
+     * silent substitution where a wrong value is worse than a failed deploy.
+     */
+    private final List<String> unresolvedIntrinsics = new ArrayList<>();
 
     CloudFormationTemplateEngine(String accountId, String region, String stackName, String stackId,
                                  Map<String, String> parameters,
@@ -165,6 +173,35 @@ public class CloudFormationTemplateEngine {
         return resolved.isTextual() ? resolved.asText() : resolved.toString();
     }
 
+    /**
+     * As {@link #resolveJsonAttribute}, but refuses to return a document in which any intrinsic
+     * silently fell back to its own name. For an IAM policy document that fallback is worse than a
+     * failure: {@code ${StagingBucket.Arn}} becomes the literal string {@code "StagingBucket.Arn"},
+     * which is shaped like a resource identifier, passes any null/empty check, and then matches no
+     * ARN at all, so the statement is voided and every call it was meant to permit is denied, with
+     * nothing in the stored policy to show why. Raising here instead marks the resource
+     * CREATE_FAILED with the intrinsic that could not be resolved, which is a diagnosable failure.
+     *
+     * <p>Deliberately opt-in rather than the default for {@link #resolveJsonAttribute}: stubbed
+     * resource types legitimately have no attributes, and their consumers (an environment variable,
+     * a tag, an output) still need to deploy with a placeholder. Only a policy document, where an
+     * unresolved value changes an access decision, should refuse it.
+     *
+     * @throws AwsException when any intrinsic in {@code node} could not be resolved
+     */
+    public String resolveJsonAttributeStrict(JsonNode node) {
+        int before = unresolvedIntrinsics.size();
+        String resolved = resolveJsonAttribute(node);
+        if (unresolvedIntrinsics.size() > before) {
+            List<String> raised = unresolvedIntrinsics.subList(before, unresolvedIntrinsics.size());
+            throw new AwsException("ValidationError",
+                    "Policy document contains unresolved CloudFormation intrinsics: "
+                            + String.join(", ", raised)
+                            + ". Storing them would silently void the statements that use them.", 400);
+        }
+        return resolved;
+    }
+
     private String resolveRef(String name) {
         // Pseudo-parameters
         return switch (name) {
@@ -183,6 +220,7 @@ public class CloudFormationTemplateEngine {
                     yield parameters.get(name);
                 }
                 LOG.debugv("Unresolved Ref: {0}", name);
+                unresolvedIntrinsics.add("Ref " + name);
                 yield name;
             }
         };
@@ -215,8 +253,13 @@ public class CloudFormationTemplateEngine {
                 String varName = template.substring(i + 2, end);
                 if (vars.containsKey(varName)) {
                     result.append(vars.get(varName));
-                } else if (varName.contains("!")) {
-                    // Fn::GetAtt shorthand: ${LogicalId.Attr}
+                } else if (varName.startsWith("!")) {
+                    // ${!Literal} is Fn::Sub's escape sequence for a literal ${Literal}: emit it
+                    // verbatim with no substitution. It is NOT the Fn::GetAtt shorthand.
+                    result.append("${").append(varName, 1, varName.length()).append('}');
+                } else if (!varName.startsWith("AWS::") && varName.contains(".")) {
+                    // Fn::GetAtt shorthand: ${LogicalId.Attr}. A logical id and a parameter name
+                    // are both alphanumeric, so a dot can only mean an attribute reference.
                     String[] parts = varName.split("\\.", 2);
                     result.append(resolveGetAttParts(parts[0], parts.length > 1 ? parts[1] : ""));
                 } else {
@@ -407,6 +450,7 @@ public class CloudFormationTemplateEngine {
         // CloudFormationService#NESTED_STACK_SUCCESS_STATUSES) surfaces downstream as a confusing,
         // unrelated failure with no trace of the real cause.
         LOG.warnv("Unresolved GetAtt: {0}.{1}", logicalId, attrName);
+        unresolvedIntrinsics.add("Fn::GetAtt " + logicalId + "." + attrName);
         return logicalId + "." + attrName;
     }
 

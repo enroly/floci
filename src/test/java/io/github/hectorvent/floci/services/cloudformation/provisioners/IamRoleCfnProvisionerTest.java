@@ -49,11 +49,19 @@ class IamRoleCfnProvisionerTest {
             return node == null ? null : node.asText();
         });
         when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
-        when(engine.resolveJsonAttribute(any())).thenAnswer(inv -> {
-            JsonNode node = inv.getArgument(0);
-            return node != null && node.isTextual() ? node.asText() : node.toString();
-        });
+        // Both variants behave the same for a document with nothing left unresolved, which is
+        // every document this test class feeds in. The strict one is what the provisioner calls
+        // for a policy document; the lenient one stays stubbed because other properties use it.
+        when(engine.resolveJsonAttribute(any())).thenAnswer(inv -> resolvedDocument(inv.getArgument(0)));
+        when(engine.resolveJsonAttributeStrict(any())).thenAnswer(inv -> resolvedDocument(inv.getArgument(0)));
         return new ProvisionContext(engine, "us-east-1", ACCOUNT_ID, "test-stack");
+    }
+
+    private static String resolvedDocument(JsonNode node) {
+        if (node == null) {
+            return null;
+        }
+        return node.isTextual() ? node.asText() : node.toString();
     }
 
     private StackResource resource() {

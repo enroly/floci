@@ -64,7 +64,7 @@ public class IamRoleCfnProvisioner implements CfnResourceProvisioner {
         // AWS::IAM::Policy and AWS::IAM::ManagedPolicy's PolicyDocument, and the pattern already
         // used a few lines below for each inline Policies[].PolicyDocument.
         JsonNode assumeDocNode = props != null ? props.get("AssumeRolePolicyDocument") : null;
-        String resolvedAssumeDoc = assumeDocNode != null ? ctx.engine().resolveJsonAttribute(assumeDocNode) : null;
+        String resolvedAssumeDoc = assumeDocNode != null ? ctx.engine().resolveJsonAttributeStrict(assumeDocNode) : null;
         String assumeDoc = resolvedAssumeDoc != null
                 ? resolvedAssumeDoc
                 : "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
@@ -173,7 +173,7 @@ public class IamRoleCfnProvisioner implements CfnResourceProvisioner {
                                 + " has no PolicyDocument.", 400);
                     }
                     iamService.putRolePolicy(resolvedRoleName, policyName,
-                            ctx.engine().resolveJsonAttribute(document));
+                            ctx.engine().resolveJsonAttributeStrict(document));
                     inlineWrittenByThisAttempt.add(policyName);
                 }
             }
