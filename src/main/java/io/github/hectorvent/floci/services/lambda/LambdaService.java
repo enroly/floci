@@ -1733,8 +1733,11 @@ public class LambdaService implements ResourceProvider {
                 fn.setCodeSha256(Base64.getEncoder().encodeToString(digest));
             } catch (java.security.NoSuchAlgorithmException ignored) {}
 
-            // For file-based runtimes, verify handler file exists (skip Java and .NET which use different handler formats)
-            if (fn.getRuntime() != null && !fn.getRuntime().startsWith("java") && !fn.getRuntime().startsWith("dotnet")) {
+            // For file-based runtimes, verify handler file exists (skip Java and .NET, which use
+            // different handler formats, and "provided" runtimes, for which real AWS ignores
+            // Handler entirely and always execs /var/task/bootstrap).
+            if (fn.getRuntime() != null && !fn.getRuntime().startsWith("java") && !fn.getRuntime().startsWith("dotnet")
+                    && !fn.getRuntime().startsWith("provided")) {
                 String handlerFile = resolveHandlerFilePath(fn);
                 boolean pythonRuntime = fn.getRuntime().startsWith("python");
                 boolean found;
