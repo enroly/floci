@@ -7,6 +7,7 @@ import org.jboss.logging.Logger;
 
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.container.ContainerRequestContext;
+import jakarta.ws.rs.core.MultivaluedMap;
 
 /**
  * Maps (credentialScope, httpMethod, requestPath) → IAM action string.
@@ -151,64 +152,128 @@ public class IamActionRegistry {
         return null;
     }
 
-    // Subresources S3Controller dispatches ahead of accelerate in its PUT and GET
-    // chains (acl and tagging are resolved above). When one rides along, that
-    // operation is what executes, so the accelerate mapping must not claim the
-    // request. Mirrors the controller's dispatch order — extend together.
-    private static final List<String> PUT_SUBRESOURCES_BEFORE_ACCELERATE = List.of(
-            "notification", "versioning", "object-lock", "website", "logging", "policy",
-            "cors", "lifecycle", "encryption", "publicAccessBlock", "ownershipControls",
-            "requestPayment");
-    private static final List<String> GET_SUBRESOURCES_BEFORE_ACCELERATE = List.of(
-            "uploads", "notification", "versioning", "versions", "location", "object-lock",
-            "website", "logging", "policy", "cors", "lifecycle", "encryption",
-            "publicAccessBlock", "ownershipControls", "requestPayment");
+    /** One bucket sub-resource operation: the query parameter that selects it, and the IAM action. */
+    private record SubResourceAction(String queryParameter, String action) {}
+
+    private static SubResourceAction sub(String queryParameter, String action) {
+        return new SubResourceAction(queryParameter, action);
+    }
+
+    // The bucket sub-resource chains, in S3Controller's dispatch order. The first sub-resource
+    // present on the request is the operation that actually executes, so the first match here is
+    // the action that operation needs. Order and membership mirror S3Controller's PUT, GET and
+    // DELETE bucket methods exactly - extend together.
+    //
+    // Without these, method + path alone decide, so every bucket sub-resource write resolved to
+    // s3:CreateBucket and every read to s3:ListBucket. That is not merely imprecise: a role granted
+    // exactly what real AWS requires (CDK's BucketNotificationsHandler grants s3:PutBucketNotification
+    // on "*") was denied for want of s3:CreateBucket, a permission real AWS never asks for. The
+    // DELETE chain was the widest miss, demanding s3:DeleteBucket to remove a CORS or lifecycle rule.
+    //
+    // The read action names are the ones S3Controller already passes to authorizeBucketRead for the
+    // same operations, so the two paths can no longer disagree about what a request needs.
+    //
+    // ?replication appears only under DELETE because that is the only method S3Controller dispatches
+    // it on; on PUT and GET it falls through to create/list the bucket, which is what those requests
+    // really do, and the action must describe the operation that runs.
+    private static final List<SubResourceAction> GET_BUCKET_SUBRESOURCES = List.of(
+            sub("uploads",           "s3:ListBucketMultipartUploads"),
+            sub("notification",      "s3:GetBucketNotification"),
+            sub("versioning",        "s3:GetBucketVersioning"),
+            sub("versions",          "s3:ListBucketVersions"),
+            sub("location",          "s3:GetBucketLocation"),
+            sub("tagging",           "s3:GetBucketTagging"),
+            sub("object-lock",       "s3:GetBucketObjectLockConfiguration"),
+            sub("website",           "s3:GetBucketWebsite"),
+            sub("logging",           "s3:GetBucketLogging"),
+            sub("policy",            "s3:GetBucketPolicy"),
+            sub("cors",              "s3:GetBucketCORS"),
+            sub("lifecycle",         "s3:GetLifecycleConfiguration"),
+            sub("acl",               "s3:GetBucketAcl"),
+            sub("encryption",        "s3:GetEncryptionConfiguration"),
+            sub("publicAccessBlock", "s3:GetBucketPublicAccessBlock"),
+            sub("ownershipControls", "s3:GetBucketOwnershipControls"),
+            sub("requestPayment",    "s3:GetBucketRequestPayment"),
+            sub("accelerate",        "s3:GetAccelerateConfiguration"),
+            sub("metrics",           "s3:GetMetricsConfiguration"));
+
+    private static final List<SubResourceAction> PUT_BUCKET_SUBRESOURCES = List.of(
+            sub("notification",      "s3:PutBucketNotification"),
+            sub("versioning",        "s3:PutBucketVersioning"),
+            sub("tagging",           "s3:PutBucketTagging"),
+            sub("object-lock",       "s3:PutBucketObjectLockConfiguration"),
+            sub("website",           "s3:PutBucketWebsite"),
+            sub("logging",           "s3:PutBucketLogging"),
+            sub("policy",            "s3:PutBucketPolicy"),
+            sub("cors",              "s3:PutBucketCORS"),
+            sub("lifecycle",         "s3:PutLifecycleConfiguration"),
+            sub("acl",               "s3:PutBucketAcl"),
+            sub("encryption",        "s3:PutEncryptionConfiguration"),
+            sub("publicAccessBlock", "s3:PutBucketPublicAccessBlock"),
+            sub("ownershipControls", "s3:PutBucketOwnershipControls"),
+            sub("requestPayment",    "s3:PutBucketRequestPayment"),
+            sub("accelerate",        "s3:PutAccelerateConfiguration"),
+            sub("metrics",           "s3:PutMetricsConfiguration"));
+
+    // AWS gives only DeleteBucketPolicy and DeleteBucketWebsite their own action; removing any other
+    // sub-resource is authorised by the same Put* action that sets it. ?accelerate is absent because
+    // S3Controller rejects DELETE on it with 405, so no mapping should claim the request.
+    private static final List<SubResourceAction> DELETE_BUCKET_SUBRESOURCES = List.of(
+            sub("tagging",           "s3:DeleteBucketTagging"),
+            sub("website",           "s3:DeleteBucketWebsite"),
+            sub("policy",            "s3:DeleteBucketPolicy"),
+            sub("cors",              "s3:PutBucketCORS"),
+            sub("lifecycle",         "s3:PutLifecycleConfiguration"),
+            sub("encryption",        "s3:PutEncryptionConfiguration"),
+            sub("publicAccessBlock", "s3:PutBucketPublicAccessBlock"),
+            sub("ownershipControls", "s3:PutBucketOwnershipControls"),
+            sub("replication",       "s3:PutReplicationConfiguration"),
+            sub("metrics",           "s3:PutMetricsConfiguration"));
 
     /**
-     * Resolves S3 sub-resource ops (ACL, tagging, retention, etc.) that
-     * cannot be distinguished from the parent op by HTTP method + path alone.
-     * Returns null when no sub-resource is present so the caller falls back
-     * to the standard rule table.
+     * Resolves S3 sub-resource ops (ACL, tagging, notification, lifecycle, ...) that cannot be
+     * distinguished from the parent op by HTTP method + path alone. Returns null when no sub-resource
+     * claims the request so the caller falls back to the standard rule table.
      */
     private static String resolveS3SubResourceAction(String method, ContainerRequestContext ctx) {
-        var params = ctx.getUriInfo().getQueryParameters();
-        boolean acl = params.containsKey("acl");
-        boolean tagging = params.containsKey("tagging");
-        boolean accelerate = params.containsKey("accelerate");
-        if (!acl && !tagging && !accelerate) {
-            return null;
-        }
-        // /{bucket}?acl → bucket-level; /{bucket}/{key}?acl → object-level
+        MultivaluedMap<String, String> params = ctx.getUriInfo().getQueryParameters();
+        // /{bucket}?acl -> bucket-level; /{bucket}/{key}?acl -> object-level.
+        // A trailing slash is a valid key character, so /bucket/folder/?acl is an object request -
+        // we cannot use endsWith("/") to infer bucket-level.
         String path = ctx.getUriInfo().getPath();
-        // Strip leading slash, then check whether there is a key segment after the bucket.
-        // A trailing slash is a valid key character, so /bucket/folder/?acl is an object
-        // request — we cannot use endsWith("/") to infer bucket-level.
         String stripped = path.startsWith("/") ? path.substring(1) : path;
         int firstSlash = stripped.indexOf('/');
         boolean isBucketLevel = firstSlash < 0 || firstSlash == stripped.length() - 1;
-        if (acl) {
-            if (isBucketLevel) {
-                return switch (method) {
-                    case "GET" -> "s3:GetBucketAcl";
-                    case "PUT" -> "s3:PutBucketAcl";
-                    default -> null;
-                };
+        if (!isBucketLevel) {
+            return objectSubResourceAction(method, params);
+        }
+        List<SubResourceAction> chain = switch (method) {
+            case "GET" -> GET_BUCKET_SUBRESOURCES;
+            case "PUT" -> PUT_BUCKET_SUBRESOURCES;
+            case "DELETE" -> DELETE_BUCKET_SUBRESOURCES;
+            default -> List.of();
+        };
+        for (SubResourceAction entry : chain) {
+            if (params.containsKey(entry.queryParameter())) {
+                return entry.action();
             }
+        }
+        return null;
+    }
+
+    /**
+     * The object-level sub-resources. Everything else (?accelerate, ?notification, ...) is a
+     * bucket-only sub-resource that the object routes ignore, so it must not claim an object request.
+     */
+    private static String objectSubResourceAction(String method, MultivaluedMap<String, String> params) {
+        if (params.containsKey("acl")) {
             return switch (method) {
                 case "GET" -> "s3:GetObjectAcl";
                 case "PUT" -> "s3:PutObjectAcl";
                 default -> null;
             };
         }
-        if (tagging) {
-            if (isBucketLevel) {
-                return switch (method) {
-                    case "GET" -> "s3:GetBucketTagging";
-                    case "PUT" -> "s3:PutBucketTagging";
-                    case "DELETE" -> "s3:DeleteBucketTagging";
-                    default -> null;
-                };
-            }
+        if (params.containsKey("tagging")) {
             return switch (method) {
                 case "GET" -> "s3:GetObjectTagging";
                 case "PUT" -> "s3:PutObjectTagging";
@@ -216,26 +281,7 @@ public class IamActionRegistry {
                 default -> null;
             };
         }
-        // Accelerate is a bucket-only subresource, and ?accelerate on an object path is
-        // inert — the object routes ignore it — so only a bucket-level request maps here;
-        // everything else falls through to the standard rule table.
-        if (!isBucketLevel) {
-            return null;
-        }
-        List<String> dispatchedFirst = "PUT".equals(method)
-                ? PUT_SUBRESOURCES_BEFORE_ACCELERATE
-                : GET_SUBRESOURCES_BEFORE_ACCELERATE;
-        for (String subresource : dispatchedFirst) {
-            if (params.containsKey(subresource)) {
-                return null;
-            }
-        }
-        return switch (method) {
-            case "GET" -> "s3:GetAccelerateConfiguration";
-            case "PUT" -> "s3:PutAccelerateConfiguration";
-            // AWS defines no DELETE for the subresource.
-            default -> null;
-        };
+        return null;
     }
 
     /**
