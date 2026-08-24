@@ -109,7 +109,8 @@ class IamEnforcementFilterTest {
                 eq("arn:aws:lambda:us-east-1:222233334444:function:fn"),
                 isNull()))
                 .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
-        when(conditionContextResolver.resolve("lambda", "lambda:InvokeFunction", containerRequest))
+        when(conditionContextResolver.resolve(eq("lambda"), eq("lambda:InvokeFunction"), eq(containerRequest),
+                any(), any(), any()))
                 .thenReturn(null);
 
         IamEnforcementFilter filter = newFilter();
@@ -158,7 +159,8 @@ class IamEnforcementFilterTest {
                         ]}""")));
         when(arnBuilder.build("s3", containerRequest, "us-east-1", "222233334444"))
                 .thenReturn("arn:aws:s3:::bucket");
-        when(conditionContextResolver.resolve("s3", "s3:ListBucket", containerRequest))
+        when(conditionContextResolver.resolve(eq("s3"), eq("s3:ListBucket"), eq(containerRequest),
+                any(), any(), any()))
                 .thenReturn(conditions);
         when(evaluator.evaluate(any(), isNull(), eq("s3:ListBucket"), eq("arn:aws:s3:::bucket"), eq(conditions)))
                 .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
@@ -202,7 +204,8 @@ class IamEnforcementFilterTest {
         // Everything keyed by scope must see the canonical name, not the alias.
         verify(actionRegistry).resolve("s3", containerRequest);
         verify(arnBuilder).build(eq("s3"), eq(containerRequest), anyString(), anyString());
-        verify(conditionContextResolver).resolve("s3", "s3:GetObject", containerRequest);
+        verify(conditionContextResolver).resolve(eq("s3"), eq("s3:GetObject"), eq(containerRequest),
+                any(), any(), any());
         // The policy above grants only s3:PutObject, so a GetObject signed as s3express is denied.
         verify(containerRequest).abortWith(any(Response.class));
     }
