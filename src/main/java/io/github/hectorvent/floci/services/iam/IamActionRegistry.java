@@ -1,11 +1,5 @@
 package io.github.hectorvent.floci.services.iam;
 
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.net.URLDecoder;
-import java.nio.charset.Charset;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.regex.Pattern;
 
@@ -13,7 +7,6 @@ import org.jboss.logging.Logger;
 
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.container.ContainerRequestContext;
-import jakarta.ws.rs.core.MediaType;
 
 /**
  * Maps (credentialScope, httpMethod, requestPath) → IAM action string.
@@ -253,49 +246,9 @@ public class IamActionRegistry {
      * request is not form-encoded or the body has no {@code Action} field.
      */
     private static String readFormAction(ContainerRequestContext ctx) {
-        MediaType mt = ctx.getMediaType();
-        if (mt == null
-                || !"application".equalsIgnoreCase(mt.getType())
-                || !"x-www-form-urlencoded".equalsIgnoreCase(mt.getSubtype())) {
-            return null;
-        }
-        InputStream in = ctx.getEntityStream();
-        if (in == null) {
-            return null;
-        }
-        byte[] body;
-        try {
-            body = in.readAllBytes();
-        } catch (IOException e) {
-            LOG.debugv(e, "Failed to buffer form body for IAM action resolution");
-            return null;
-        }
-        ctx.setEntityStream(new ByteArrayInputStream(body));
-        if (body.length == 0) {
-            return null;
-        }
-        Charset charset = resolveCharset(mt);
-        String form = new String(body, charset);
-        for (String pair : form.split("&")) {
-            int eq = pair.indexOf('=');
-            String key = eq < 0 ? pair : pair.substring(0, eq);
-            if (!"Action".equals(URLDecoder.decode(key, charset))) {
-                continue;
-            }
-            return eq < 0 ? "" : URLDecoder.decode(pair.substring(eq + 1), charset);
-        }
-        return null;
-    }
-
-    private static Charset resolveCharset(MediaType mt) {
-        String name = mt.getParameters().get("charset");
-        if (name == null || name.isBlank()) {
-            return StandardCharsets.UTF_8;
-        }
-        try {
-            return Charset.forName(name);
-        } catch (RuntimeException e) {
-            return StandardCharsets.UTF_8;
-        }
+        // Delegates to RequestBodyReader so this and ResourceArnBuilder's per-service resource
+        // lookups share one buffered copy of the body per request instead of each independently
+        // reading (and needing to reset) the live entity stream.
+        return RequestBodyReader.formField(ctx, "Action");
     }
 }
