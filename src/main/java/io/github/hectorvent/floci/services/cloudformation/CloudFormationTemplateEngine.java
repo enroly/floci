@@ -399,7 +399,14 @@ public class CloudFormationTemplateEngine {
         if (attrs != null && attrs.containsKey(attrName)) {
             return attrs.get(attrName);
         }
-        LOG.debugv("Unresolved GetAtt: {0}.{1}", logicalId, attrName);
+        // Deliberately a literal fallback rather than a thrown exception: stubbed resource types
+        // (e.g. AWS::ElastiCache::CacheCluster) legitimately have no attributes at all, and their
+        // consumers still need to deploy. Promoted from debugv to warnv because this is otherwise
+        // silent, and a missing entry here (most often a nested stack whose own resource loop
+        // failed and rolled back before its Outputs were ever computed, see
+        // CloudFormationService#NESTED_STACK_SUCCESS_STATUSES) surfaces downstream as a confusing,
+        // unrelated failure with no trace of the real cause.
+        LOG.warnv("Unresolved GetAtt: {0}.{1}", logicalId, attrName);
         return logicalId + "." + attrName;
     }
 
