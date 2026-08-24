@@ -2864,6 +2864,22 @@ public class CloudFormationResourceProvisioner {
     // ── IAM Policy ────────────────────────────────────────────────────────────
 
     /**
+     * Resolves a {@code PolicyDocument} property to its stored string form, running it through the
+     * template engine so CloudFormation intrinsics (Ref, Fn::GetAtt, Fn::Join, ...) inside it are
+     * resolved to real values before the document is persisted. Real CloudFormation never stores an
+     * unresolved intrinsic where IAM expects a resource ARN; storing one here voids the containing
+     * statement, since a Resource/Action list that isn't a plain string or array of strings matches
+     * nothing (see {@code IamPolicyEvaluator.nodeToList}). Falls back to an empty-statement document
+     * when the property is absent, explicitly null, or resolves to nothing: the same default both
+     * call sites already fell back to before this method existed.
+     */
+    private static String resolvePolicyDocument(JsonNode props, CloudFormationTemplateEngine engine) {
+        JsonNode documentNode = props != null ? props.get("PolicyDocument") : null;
+        String resolved = documentNode != null ? engine.resolveJsonAttribute(documentNode) : null;
+        return resolved != null ? resolved : "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+    }
+
+    /**
      * Provisions {@code AWS::IAM::Policy}, which in AWS is an <em>inline</em> policy embedded in the
      * named roles/users/groups (equivalent to PutRolePolicy/PutUserPolicy/PutGroupPolicy) — <em>not</em>
      * a standalone managed policy. Because an inline policy name is scoped to the principal that owns
@@ -2885,9 +2901,7 @@ public class CloudFormationResourceProvisioner {
                     ? previousPolicyName
                     : generatePhysicalName(stackName, r.getLogicalId(), 128, false);
         }
-        String document = props != null && props.has("PolicyDocument")
-                ? props.get("PolicyDocument").toString()
-                : "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+        String document = resolvePolicyDocument(props, engine);
 
         final String name = policyName;
         final String doc = document;
@@ -3044,9 +3058,7 @@ public class CloudFormationResourceProvisioner {
         if (policyName == null || policyName.isBlank()) {
             policyName = generatePhysicalName(stackName, r.getLogicalId(), 128, false);
         }
-        String document = props != null && props.has("PolicyDocument")
-                ? props.get("PolicyDocument").toString()
-                : "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+        String document = resolvePolicyDocument(props, engine);
         List<String> roleNames = resolveStringList(props, "Roles", engine);
 
         var policy = iamService.createPolicy(policyName, "/", null, document, Map.of());
