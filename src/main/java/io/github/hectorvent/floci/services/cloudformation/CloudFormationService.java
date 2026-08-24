@@ -1685,6 +1685,25 @@ public class CloudFormationService {
                 && normalizedHost.endsWith("." + normalizedSuffix);
     }
 
+    /**
+     * Terminal statuses under which {@link #executeTemplate} actually finished creating or
+     * updating a stack's resources and computed its Outputs, including the two "committed but
+     * still tidying up" statuses, which still mean Outputs were resolved successfully.
+     *
+     * <p>Every other terminal status ({@code ROLLBACK_COMPLETE}, {@code ROLLBACK_FAILED},
+     * {@code UPDATE_ROLLBACK_COMPLETE}, {@code UPDATE_ROLLBACK_FAILED}, {@code CREATE_FAILED},
+     * {@code UPDATE_FAILED}) means the resource loop failed and rolled back before Outputs were
+     * ever computed: see {@link #executeTemplate}, which only reaches its Outputs block once the
+     * whole resource loop has succeeded. This is deliberately an allow-list rather than a
+     * deny-list of failure strings: a nested stack's own {@code rollbackFailedExecution} rewrites
+     * its status past {@code CREATE_FAILED}/{@code UPDATE_FAILED} into one of the ROLLBACK_*
+     * statuses before this method ever inspects it, so checking for the FAILED strings here can
+     * never match on a create and silently reports a stack that rolled back to nothing as
+     * CREATE_COMPLETE.
+     */
+    private static final Set<String> NESTED_STACK_SUCCESS_STATUSES = Set.of(
+            "CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS");
+
     private StackResource executeNestedStack(Stack parentStack, String logicalId, JsonNode props,
                                              CloudFormationTemplateEngine engine, String region,
                                              String accountId, boolean isCreate) {
@@ -1718,11 +1737,11 @@ public class CloudFormationService {
         resource.getAttributes().put("Arn", childStack.getStackId());
         childStack.getOutputs().forEach((k, v) -> resource.getAttributes().put("Outputs." + k, v));
 
-        if ("CREATE_FAILED".equals(childStack.getStatus()) || "UPDATE_FAILED".equals(childStack.getStatus())) {
+        if (NESTED_STACK_SUCCESS_STATUSES.contains(childStack.getStatus())) {
+            resource.setStatus("CREATE_COMPLETE");
+        } else {
             resource.setStatus("CREATE_FAILED");
             resource.setStatusReason("Nested stack " + childStackName + " failed: " + childStack.getStatusReason());
-        } else {
-            resource.setStatus("CREATE_COMPLETE");
         }
 
         return resource;
