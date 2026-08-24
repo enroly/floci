@@ -58,8 +58,15 @@ public class IamRoleCfnProvisioner implements CfnResourceProvisioner {
             throw new AwsException("ValidationError",
                     "Updating RoleName requires resource replacement, which is not supported.", 400);
         }
-        String assumeDoc = props != null && props.has("AssumeRolePolicyDocument")
-                ? props.get("AssumeRolePolicyDocument").toString()
+        // Resolved through the template engine, not a raw JsonNode.toString(), so a trust policy
+        // built from CloudFormation intrinsics (Ref, Fn::GetAtt, Fn::Join) is stored with real
+        // values instead of the unresolved template fragment. Mirrors the fix already applied to
+        // AWS::IAM::Policy and AWS::IAM::ManagedPolicy's PolicyDocument, and the pattern already
+        // used a few lines below for each inline Policies[].PolicyDocument.
+        JsonNode assumeDocNode = props != null ? props.get("AssumeRolePolicyDocument") : null;
+        String resolvedAssumeDoc = assumeDocNode != null ? ctx.engine().resolveJsonAttribute(assumeDocNode) : null;
+        String assumeDoc = resolvedAssumeDoc != null
+                ? resolvedAssumeDoc
                 : "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
         String path = ctx.resolveOptional(props, "Path");
         if (path == null) {
