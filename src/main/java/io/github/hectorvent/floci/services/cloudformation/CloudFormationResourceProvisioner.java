@@ -379,8 +379,6 @@ public class CloudFormationResourceProvisioner {
                         provisionCognitoUserPool(resource, properties, engine, region, accountId, stackName);
                 case "AWS::Cognito::UserPoolClient" ->
                         provisionCognitoUserPoolClient(resource, properties, engine, region, accountId, stackName);
-                case "AWS::Cognito::UserPoolGroup" ->
-                        provisionCognitoUserPoolGroup(resource, properties, engine, stackName);
                 case "AWS::CloudFormation::CustomResource" ->
                         provisionCustomResource(resource, properties, engine, region, accountId, stackName);
                 case "Custom::DynamoDBReplica" -> provisionDynamoDbReplica(resource, properties, engine, region);
@@ -547,20 +545,6 @@ public class CloudFormationResourceProvisioner {
                     apiGatewayV2Service.deleteAuthorizer(region, apiId, resource.getPhysicalId());
                 } catch (Exception e) {
                     LOG.debugv("Error deleting authorizer {0}: {1}", resource.getPhysicalId(), e.getMessage());
-                }
-            }
-            return;
-        }
-        // A group is keyed by pool id plus group name, and the physical id carries only the name,
-        // so the generic type/physicalId delete path cannot address it — same shape as the
-        // Nodegroup case above. The pool id is stored as an attribute at provision time.
-        if ("AWS::Cognito::UserPoolGroup".equals(resourceType)) {
-            String userPoolId = resource.getAttributes().get("UserPoolId");
-            if (userPoolId != null && !userPoolId.isBlank()) {
-                try {
-                    cognitoService.deleteGroup(userPoolId, resource.getPhysicalId());
-                } catch (Exception e) {
-                    LOG.debugv("Error deleting Cognito group {0}: {1}", resource.getPhysicalId(), e.getMessage());
                 }
             }
             return;
@@ -6049,32 +6033,6 @@ public class CloudFormationResourceProvisioner {
         r.getAttributes().put("UserPoolId", pool.getId());
         r.getAttributes().put("ProviderName", pool.getName());
         r.getAttributes().put("ProviderURL", cognitoService.getIssuer(pool.getId()));
-    }
-
-    private void provisionCognitoUserPoolGroup(StackResource r, JsonNode props,
-                                               CloudFormationTemplateEngine engine, String stackName) {
-        String userPoolId = resolveOptional(props, "UserPoolId", engine);
-        if (userPoolId == null || userPoolId.isBlank()) {
-            throw new IllegalArgumentException("UserPoolId is required for AWS::Cognito::UserPoolGroup");
-        }
-        String groupName = resolveOptional(props, "GroupName", engine);
-        if (groupName == null || groupName.isBlank()) {
-            groupName = generatePhysicalName(stackName, r.getLogicalId(), 128, false);
-        }
-        String description = resolveOptional(props, "Description", engine);
-        Integer precedence = parseIntegerPropOrNull(props, "Precedence", engine);
-        String roleArn = resolveOptional(props, "RoleArn", engine);
-
-        // A group is addressed by its name, so a renamed group has nothing to update under the new
-        // name. That is a replacement on AWS too, and the same shape as any other name-keyed type.
-        if (groupName.equals(r.getPhysicalId())) {
-            cognitoService.updateGroup(userPoolId, groupName, description, precedence, roleArn);
-        } else {
-            cognitoService.createGroup(userPoolId, groupName, description, precedence, roleArn);
-        }
-
-        r.setPhysicalId(groupName);
-        r.getAttributes().put("UserPoolId", userPoolId);
     }
 
     private void provisionCognitoUserPoolClient(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
