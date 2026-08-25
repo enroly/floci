@@ -252,11 +252,7 @@ public class CognitoService {
                 throw new AwsException("InvalidParameterException", "Attribute name contains invalid characters.", 400);
             }
 
-            boolean developerOnly = Boolean.TRUE.equals(attr.get("DeveloperOnlyAttribute"));
-            String prefix = developerOnly ? "dev:" : "custom:";
-            if (!name.startsWith("custom:") && !name.startsWith("dev:")) {
-                attr.put("Name", prefix + name);
-            }
+            attr.put("Name", prefixedAttributeName(name, Boolean.TRUE.equals(attr.get("DeveloperOnlyAttribute"))));
 
             String finalName = (String) attr.get("Name");
             boolean exists = schema.stream().anyMatch(existing -> finalName.equals(existing.get("Name")));
@@ -272,12 +268,51 @@ public class CognitoService {
         LOG.infov("Added custom attributes to User Pool: {0}", userPoolId);
     }
 
+    /**
+     * The name AWS stores for a schema attribute: a non-standard attribute is namespaced under
+     * {@code custom:} (or {@code dev:} when it is developer-only), a name that already carries
+     * either prefix is left as it is.
+     */
+    private static String prefixedAttributeName(String name, boolean developerOnly) {
+        if (name.startsWith("custom:") || name.startsWith("dev:")) {
+            return name;
+        }
+        return (developerOnly ? "dev:" : "custom:") + name;
+    }
+
+    /**
+     * Applies that same namespacing to a whole CreateUserPool/UpdateUserPool {@code Schema} list.
+     * The Schema property carries custom attributes unprefixed, which is what CloudFormation and
+     * the SDKs send, and AWS prefixes them on the way in: a pool declaring {@code StudentNo} reads
+     * back as {@code custom:StudentNo}, which is also the name every client uses for the claim.
+     * Standard attributes travel in the same list to override a default (typically to make email
+     * required), so they are left alone; prefixing those would file them as custom attributes and
+     * leave the default definition in force.
+     */
+    private static List<Map<String, Object>> prefixCustomSchemaAttributes(List<Map<String, Object>> schema) {
+        if (schema == null) {
+            return null;
+        }
+        List<Map<String, Object>> prefixed = new ArrayList<>(schema.size());
+        for (Map<String, Object> attr : schema) {
+            String name = attr == null ? null : (String) attr.get("Name");
+            if (name == null || name.isBlank() || CognitoStandardAttributes.isStandard(name)) {
+                prefixed.add(attr);
+                continue;
+            }
+            Map<String, Object> copy = new HashMap<>(attr);
+            copy.put("Name", prefixedAttributeName(name, Boolean.TRUE.equals(attr.get("DeveloperOnlyAttribute"))));
+            prefixed.add(copy);
+        }
+        return prefixed;
+    }
+
     @SuppressWarnings("unchecked")
     private void populateUserPool(UserPool pool, Map<String, Object> request) {
         if (request.containsKey("Policies")) pool.setPolicies((Map<String, Object>) request.get("Policies"));
         if (request.containsKey("DeletionProtection")) pool.setDeletionProtection((String) request.get("DeletionProtection"));
         if (request.containsKey("LambdaConfig")) pool.setLambdaConfig((Map<String, Object>) request.get("LambdaConfig"));
-        if (request.containsKey("Schema")) pool.setSchemaAttributes((List<Map<String, Object>>) request.get("Schema"));
+        if (request.containsKey("Schema")) pool.setSchemaAttributes(prefixCustomSchemaAttributes((List<Map<String, Object>>) request.get("Schema")));
         if (request.containsKey("AutoVerifiedAttributes")) pool.setAutoVerifiedAttributes((List<String>) request.get("AutoVerifiedAttributes"));
         if (request.containsKey("AliasAttributes")) pool.setAliasAttributes((List<String>) request.get("AliasAttributes"));
         if (request.containsKey("UsernameAttributes")) pool.setUsernameAttributes((List<String>) request.get("UsernameAttributes"));

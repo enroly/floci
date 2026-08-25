@@ -14,11 +14,13 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.nullValue;
 
 /**
  * End-to-end check that CloudFormation provisions an AWS::Cognito::UserPoolGroup into
  * CognitoService for real, rather than stubbing it and reporting CREATE_COMPLETE for a group the
- * pool never gained.
+ * pool never gained, and that the custom attributes a pool declares in its Schema read back under
+ * the {@code custom:} namespace AWS files them in.
  */
 @QuarkusTest
 class CloudFormationCognitoUserPoolGroupIntegrationTest {
@@ -148,6 +150,25 @@ class CloudFormationCognitoUserPoolGroupIntegrationTest {
 
         cognito("GetGroup", "{\"UserPoolId\": \"" + poolId + "\", \"GroupName\": \"student\"}")
             .statusCode(200);
+    }
+
+    @Test
+    void poolSchemaCustomAttributesAreNamespacedAndStandardOnesAreNot() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "cfn-cognito-schema-" + suffix;
+
+        String poolId = createStack(stackName, poolAndGroupsTemplate("admin", 0));
+
+        cognito("DescribeUserPool", "{\"UserPoolId\": \"" + poolId + "\"}")
+            .statusCode(200)
+            // The template declares StudentNo unprefixed, as CloudFormation and the SDKs do.
+            .body("UserPool.SchemaAttributes.find { it.Name == 'custom:StudentNo' }.AttributeDataType",
+                    equalTo("String"))
+            .body("UserPool.SchemaAttributes.find { it.Name == 'StudentNo' }", nullValue())
+            // A standard attribute in the same list overrides its default rather than becoming a
+            // custom one, so email stays bare and keeps the Required the template asked for.
+            .body("UserPool.SchemaAttributes.find { it.Name == 'email' }.Required", equalTo(true))
+            .body("UserPool.SchemaAttributes.find { it.Name == 'custom:email' }", nullValue());
     }
 
     /** Creates the stack, asserts it completed, and returns the pool id from its outputs. */
