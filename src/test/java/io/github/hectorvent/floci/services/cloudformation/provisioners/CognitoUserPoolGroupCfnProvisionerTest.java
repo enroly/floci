@@ -125,6 +125,16 @@ class CognitoUserPoolGroupCfnProvisionerTest {
     }
 
     @Test
+    void aNonIntegerPrecedenceFailsTheResourceRatherThanBeingDropped() {
+        ObjectNode props = props("us-east-1_pool", "admin");
+        props.put("Precedence", "not-a-number");
+        StackResource r = resource(null);
+
+        assertThrows(IllegalArgumentException.class, () -> provisioner.provision(r, props, ctx()));
+        verifyNoInteractions(cognito);
+    }
+
+    @Test
     void deleteUsesTheStoredPoolIdAndTheGroupName() {
         StackResource r = resource("admin");
         r.setAttributes(new HashMap<>(Map.of("UserPoolId", "us-east-1_pool")));

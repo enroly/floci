@@ -49,7 +49,7 @@ public class CognitoUserPoolGroupCfnProvisioner implements CfnResourceProvisione
             groupName = ctx.generatePhysicalName(r.getLogicalId(), 128, false);
         }
         String description = ctx.resolveOptional(props, "Description");
-        Integer precedence = parseInteger(ctx.resolveOptional(props, "Precedence"));
+        Integer precedence = parsePrecedence(ctx.resolveOptional(props, "Precedence"));
         String roleArn = ctx.resolveOptional(props, "RoleArn");
 
         // provision is also the update path. A group is addressed by its name, so a renamed group
@@ -83,14 +83,22 @@ public class CognitoUserPoolGroupCfnProvisioner implements CfnResourceProvisione
         }
     }
 
-    private static Integer parseInteger(String value) {
+    /**
+     * Precedence decides which group's role wins and the order groups appear in the token, so a
+     * value AWS would reject fails the resource rather than being dropped. The monolith's shared
+     * helper returned null on a bad number, but this type never had a handler there, so there is
+     * no prior behaviour to preserve, and silently losing the value is the failure this whole
+     * change is about.
+     */
+    private static Integer parsePrecedence(String value) {
         if (value == null || value.isBlank()) {
             return null;
         }
         try {
             return Integer.valueOf(value.trim());
         } catch (NumberFormatException e) {
-            return null;
+            throw new IllegalArgumentException(
+                    "Precedence must be an integer for AWS::Cognito::UserPoolGroup, got: " + value, e);
         }
     }
 }
