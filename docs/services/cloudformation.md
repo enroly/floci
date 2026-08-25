@@ -75,7 +75,7 @@ cross-resource references.
 | API Gateway v2 | `Api`, `Route`, `Integration`, `Stage`, `Deployment` |
 | Step Functions | `StateMachine` |
 | Batch | `ComputeEnvironment`, `JobQueue`, `JobDefinition` |
-| Cognito | `UserPool`, `UserPoolClient` |
+| Cognito | `UserPool`, `UserPoolClient`, `UserPoolGroup` |
 | EventBridge | `Rule`, `EventBus`, `EventBusPolicy` |
 | Pipes | `Pipe` |
 | Kinesis | `Stream` |
