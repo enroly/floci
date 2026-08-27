@@ -182,6 +182,11 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
      * against one already written under its proper prefix, and a superseded legacy key is
      * deleted rather than left to collide again on a later restart.
      */
+    /** Removes one physical storage entry without applying account scoping. */
+    public void deleteRawEntry(String rawKey) {
+        delegate.delete(rawKey);
+    }
+
     public Map<String, V> scanAllAccountsRaw() {
         Map<String, V> result = new LinkedHashMap<>();
         List<String> legacyKeys = new ArrayList<>();

@@ -124,6 +124,7 @@ floci:
       default-presign-expiry-seconds: 3600
     dynamodb:
       enabled: true
+      item-key-delimiter: "#"
     sns:
       enabled: true
     lambda:

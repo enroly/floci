@@ -50,4 +50,15 @@ class ApplicationDefaultsTest {
                         .asBoolean(true),
                 "production application.yml should not create default admin credentials unless enabled");
     }
+
+    @Test
+    void productionConfigUsesHashAsTheDynamoDbItemKeyDelimiter() throws IOException {
+        JsonNode config = new YAMLMapper().readTree(Path.of("src/main/resources/application.yml").toFile());
+
+        assertEquals("#", config.path("floci")
+                .path("services")
+                .path("dynamodb")
+                .path("item-key-delimiter")
+                .asText());
+    }
 }

@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.dynamodb;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -41,11 +42,15 @@ import java.util.LinkedHashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 import java.util.zip.GZIPOutputStream;
@@ -77,7 +82,7 @@ public class DynamoDbService implements ResourceProvider {
     private final StorageBackend<String, Map<String, JsonNode>> itemStore;
     private final StorageBackend<String, ExportDescription> exportStore;
     // Items stored per table: storageKey -> Map<itemKey, item>
-    // itemKey is "pk" or "pk#sk" depending on table schema
+    // Composite item keys use the configured delimiter; HASH-only keys remain bare.
     private final ConcurrentHashMap<String, ConcurrentSkipListMap<String, JsonNode>> itemsByTable = new ConcurrentHashMap<>();
     // Per-item locks: storageKey -> itemKey -> ReentrantLock. Locks are created lazily
     // on first access and cleared with the table (see deleteTable); transactWriteItems
@@ -93,41 +98,58 @@ public class DynamoDbService implements ResourceProvider {
 
     private static final int MAX_MULTI_ATTRIBUTE_KEY_PART_SIZE = 4;
 
-    private record IdempotencyEntry(String requestHash, long insertedAtNanos) {}
+    private record IdempotencyEntry(String requestHash, long insertedAtNanos,
+                                    CompletableFuture<Void> completion) {}
+
+    private record TransactionIdempotency(IdempotencyEntry entry, boolean replay) {}
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
+    private final DynamoDbItemKey itemKey;
     private DynamoDbStreamService streamService;
     private KinesisStreamingForwarder kinesisForwarder;
     private S3Service s3Service;
+
+    public static void validateItemKeyDelimiter(String itemKeyDelimiter) {
+        new DynamoDbItemKey(itemKeyDelimiter);
+    }
 
     @Inject
     public DynamoDbService(StorageFactory storageFactory, RegionResolver regionResolver,
                            DynamoDbStreamService streamService,
                            KinesisStreamingForwarder kinesisForwarder,
                            S3Service s3Service,
-                           ObjectMapper objectMapper) {
+                           ObjectMapper objectMapper,
+                           EmulatorConfig config) {
         this(storageFactory.create("dynamodb", "dynamodb-tables.json",
                 new TypeReference<Map<String, TableDefinition>>() {}),
              storageFactory.create("dynamodb", "dynamodb-items.json",
                 new TypeReference<Map<String, Map<String, JsonNode>>>() {}),
              storageFactory.create("dynamodb", "dynamodb-exports.json",
                 new TypeReference<Map<String, ExportDescription>>() {}),
-             regionResolver, streamService, kinesisForwarder, s3Service, objectMapper);
+             regionResolver, streamService, kinesisForwarder, s3Service, objectMapper,
+             config.services().dynamodb().itemKeyDelimiter());
     }
 
     /** Package-private constructor for testing. */
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore) {
-        this(tableStore, null, null, new RegionResolver("us-east-1", "000000000000"), null, null, null, null);
+        this(tableStore, null, null, new RegionResolver("us-east-1", "000000000000"), null, null, null, null, "#");
     }
 
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore, RegionResolver regionResolver) {
-        this(tableStore, null, null, regionResolver, null, null, null, null);
+        this(tableStore, null, null, regionResolver, null, null, null, null, "#");
     }
 
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
                     StorageBackend<String, Map<String, JsonNode>> itemStore,
                     RegionResolver regionResolver) {
-        this(tableStore, itemStore, null, regionResolver, null, null, null, null);
+        this(tableStore, itemStore, null, regionResolver, null, null, null, null, "#");
+    }
+
+    DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
+                    StorageBackend<String, Map<String, JsonNode>> itemStore,
+                    RegionResolver regionResolver,
+                    String itemKeyDelimiter) {
+        this(tableStore, itemStore, null, regionResolver, null, null, null, null, itemKeyDelimiter);
     }
 
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
@@ -135,7 +157,7 @@ public class DynamoDbService implements ResourceProvider {
                     RegionResolver regionResolver,
                     DynamoDbStreamService streamService,
                     KinesisStreamingForwarder kinesisForwarder) {
-        this(tableStore, itemStore, null, regionResolver, streamService, kinesisForwarder, null, null);
+        this(tableStore, itemStore, null, regionResolver, streamService, kinesisForwarder, null, null, "#");
     }
 
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
@@ -146,6 +168,19 @@ public class DynamoDbService implements ResourceProvider {
                     KinesisStreamingForwarder kinesisForwarder,
                     S3Service s3Service,
                     ObjectMapper objectMapper) {
+        this(tableStore, itemStore, exportStore, regionResolver, streamService, kinesisForwarder,
+                s3Service, objectMapper, "#");
+    }
+
+    DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
+                    StorageBackend<String, Map<String, JsonNode>> itemStore,
+                    StorageBackend<String, ExportDescription> exportStore,
+                    RegionResolver regionResolver,
+                    DynamoDbStreamService streamService,
+                    KinesisStreamingForwarder kinesisForwarder,
+                    S3Service s3Service,
+                    ObjectMapper objectMapper,
+                    String itemKeyDelimiter) {
         this.tableStore = tableStore;
         this.itemStore = itemStore;
         this.exportStore = exportStore;
@@ -154,23 +189,234 @@ public class DynamoDbService implements ResourceProvider {
         this.kinesisForwarder = kinesisForwarder;
         this.s3Service = s3Service;
         this.objectMapper = objectMapper != null ? objectMapper : new ObjectMapper();
-        loadPersistedItems();
+        this.itemKey = new DynamoDbItemKey(itemKeyDelimiter);
     }
 
-    private void loadPersistedItems() {
-        if (itemStore == null) return;
-        // No request scope at startup, so itemStore.keys() would only see the default account.
-        // scanAllAccountsRaw() returns every account's items already in the "accountId/
-        // region::tableName" key format itemsByTable expects.
-        if (itemStore instanceof AccountAwareStorageBackend<Map<String, JsonNode>> aware) {
-            aware.scanAllAccountsRaw().forEach((rawKey, items) ->
-                itemsByTable.put(rawKey, new ConcurrentSkipListMap<>(items)));
+    private record PersistedItemMap(String key, String runtimeKey, Map<String, JsonNode> items,
+                                    boolean requiresWrite, List<String> sourceKeysToRemove) {}
+
+    private record PersistedItemSource(String sourceKey, Map<String, JsonNode> items) {}
+
+    private record PersistedTableMap(String key, TableDefinition table, boolean requiresWrite,
+                                     List<String> sourceKeysToRemove) {}
+
+    private record PersistedTableSource(String sourceKey, TableDefinition table) {}
+
+    private record TableKeySchema(String attributeName, String keyType) {}
+
+    private record TableAttribute(String attributeName, String attributeType) {}
+
+    public synchronized void loadPersistedItems() {
+        if (itemStore == null) {
             return;
         }
-        for (String key : itemStore.keys()) {
-            itemStore.get(key).ifPresent(items ->
-                itemsByTable.put(scopedItemsKey(key), new ConcurrentSkipListMap<>(items)));
+        boolean accountAware = itemStore instanceof AccountAwareStorageBackend<Map<String, JsonNode>>;
+        Map<String, PersistedTableMap> persistedTables = planPersistedTables(accountAware);
+        Map<String, List<PersistedItemSource>> persistedItems = loadPersistedItemMaps(accountAware);
+        List<PersistedItemMap> migrations = new ArrayList<>();
+
+        for (Map.Entry<String, List<PersistedItemSource>> entry : persistedItems.entrySet()) {
+            PersistedTableMap tableMigration = persistedTables.get(entry.getKey());
+            if (tableMigration == null) {
+                throw new IllegalStateException("Cannot restore DynamoDB items without their table definition");
+            }
+            TableDefinition table = tableMigration.table();
+            List<PersistedItemSource> sources = entry.getValue();
+            Map<String, JsonNode> normalizedItems = normalizePersistedItems(table, sources);
+            PersistedItemSource source = sources.getFirst();
+            boolean requiresWrite = sources.size() > 1
+                    || !source.sourceKey().equals(entry.getKey())
+                    || !normalizedItems.equals(source.items());
+            List<String> sourceKeysToRemove = sources.stream()
+                    .map(PersistedItemSource::sourceKey)
+                    .filter(sourceKey -> !sourceKey.equals(entry.getKey()))
+                    .toList();
+            String runtimeKey = accountAware ? entry.getKey() : scopedItemsKey(entry.getKey());
+            migrations.add(new PersistedItemMap(entry.getKey(), runtimeKey, normalizedItems,
+                    requiresWrite, sourceKeysToRemove));
         }
+
+        for (PersistedItemMap migration : migrations) {
+            itemsByTable.put(migration.runtimeKey(), new ConcurrentSkipListMap<>(migration.items()));
+        }
+        for (PersistedItemMap migration : migrations) {
+            if (migration.requiresWrite()) {
+                persistMigratedItems(migration.key(), migration.items(), accountAware);
+            }
+        }
+        for (PersistedTableMap migration : persistedTables.values()) {
+            if (migration.requiresWrite()) {
+                persistMigratedTable(migration.key(), migration.table(), accountAware);
+            }
+        }
+        removeSupersededItemSources(migrations, accountAware);
+        removeSupersededTableSources(persistedTables.values(), accountAware);
+    }
+
+    private void removeSupersededItemSources(List<PersistedItemMap> migrations, boolean accountAware) {
+        if (!accountAware) {
+            return;
+        }
+        AccountAwareStorageBackend<Map<String, JsonNode>> awareItemStore =
+                (AccountAwareStorageBackend<Map<String, JsonNode>>) itemStore;
+        for (PersistedItemMap migration : migrations) {
+            for (String sourceKey : migration.sourceKeysToRemove()) {
+                awareItemStore.deleteRawEntry(sourceKey);
+            }
+        }
+    }
+
+    private void removeSupersededTableSources(Iterable<PersistedTableMap> migrations, boolean accountAware) {
+        if (!accountAware) {
+            return;
+        }
+        AccountAwareStorageBackend<TableDefinition> awareTableStore =
+                (AccountAwareStorageBackend<TableDefinition>) tableStore;
+        for (PersistedTableMap migration : migrations) {
+            for (String sourceKey : migration.sourceKeysToRemove()) {
+                awareTableStore.deleteRawEntry(sourceKey);
+            }
+        }
+    }
+
+    private Map<String, List<PersistedItemSource>> loadPersistedItemMaps(boolean accountAware) {
+        Map<String, List<PersistedItemSource>> items = new HashMap<>();
+        if (accountAware) {
+            AccountAwareStorageBackend<Map<String, JsonNode>> awareItemStore =
+                    (AccountAwareStorageBackend<Map<String, JsonNode>>) itemStore;
+            for (Map.Entry<String, Map<String, JsonNode>> entry : awareItemStore.scanAllAccountsWithRawKeys().entrySet()) {
+                String key = accountScopedStorageKey(entry.getKey());
+                items.computeIfAbsent(key, ignored -> new ArrayList<>())
+                        .add(new PersistedItemSource(entry.getKey(), entry.getValue()));
+            }
+            return items;
+        }
+        for (String key : itemStore.keys()) {
+            itemStore.get(key).ifPresent(value -> items.computeIfAbsent(key, ignored -> new ArrayList<>())
+                    .add(new PersistedItemSource(key, value)));
+        }
+        return items;
+    }
+
+    private Map<String, PersistedTableMap> planPersistedTables(boolean accountAware) {
+        Map<String, PersistedTableMap> migrations = new HashMap<>();
+        for (Map.Entry<String, List<PersistedTableSource>> entry : loadPersistedTableMaps(accountAware).entrySet()) {
+            List<PersistedTableSource> sources = entry.getValue();
+            PersistedTableSource selected = sources.stream()
+                    .filter(source -> source.sourceKey().equals(entry.getKey()))
+                    .findFirst()
+                    .orElse(sources.getFirst());
+            for (PersistedTableSource source : sources) {
+                if (!hasSameTableSchema(selected.table(), source.table())) {
+                    throw new IllegalStateException("Cannot restore DynamoDB items with conflicting table definitions");
+                }
+            }
+            List<String> sourceKeysToRemove = sources.stream()
+                    .map(PersistedTableSource::sourceKey)
+                    .filter(sourceKey -> !sourceKey.equals(entry.getKey()))
+                    .toList();
+            migrations.put(entry.getKey(), new PersistedTableMap(entry.getKey(), selected.table(),
+                    sources.size() > 1 || !selected.sourceKey().equals(entry.getKey()), sourceKeysToRemove));
+        }
+        return migrations;
+    }
+
+    private Map<String, List<PersistedTableSource>> loadPersistedTableMaps(boolean accountAware) {
+        Map<String, List<PersistedTableSource>> tables = new HashMap<>();
+        if (accountAware && tableStore instanceof AccountAwareStorageBackend<TableDefinition> awareTables) {
+            for (Map.Entry<String, TableDefinition> entry : awareTables.scanAllAccountsWithRawKeys().entrySet()) {
+                String key = accountScopedStorageKey(entry.getKey());
+                tables.computeIfAbsent(key, ignored -> new ArrayList<>())
+                        .add(new PersistedTableSource(entry.getKey(), entry.getValue()));
+            }
+            return tables;
+        }
+        for (String key : tableStore.keys()) {
+            tableStore.get(key).ifPresent(value -> tables.computeIfAbsent(key, ignored -> new ArrayList<>())
+                    .add(new PersistedTableSource(key, value)));
+        }
+        return tables;
+    }
+
+    private String accountScopedStorageKey(String sourceKey) {
+        if (sourceKey.indexOf('/') >= 0) {
+            return sourceKey;
+        }
+        return regionResolver.getAccountId() + "/" + sourceKey;
+    }
+
+    private boolean hasSameTableSchema(TableDefinition first, TableDefinition second) {
+        return Objects.equals(first.getTableName(), second.getTableName())
+                && canonicalKeySchema(first).equals(canonicalKeySchema(second))
+                && canonicalAttributeDefinitions(first).equals(canonicalAttributeDefinitions(second));
+    }
+
+    private List<TableKeySchema> canonicalKeySchema(TableDefinition table) {
+        return table.getKeySchema().stream()
+                .map(key -> new TableKeySchema(key.getAttributeName(), key.getKeyType()))
+                .sorted(Comparator.comparing(TableKeySchema::attributeName)
+                        .thenComparing(TableKeySchema::keyType))
+                .toList();
+    }
+
+    private List<TableAttribute> canonicalAttributeDefinitions(TableDefinition table) {
+        return table.getAttributeDefinitions().stream()
+                .map(attribute -> new TableAttribute(attribute.getAttributeName(), attribute.getAttributeType()))
+                .sorted(Comparator.comparing(TableAttribute::attributeName)
+                        .thenComparing(TableAttribute::attributeType))
+                .toList();
+    }
+
+    private Map<String, JsonNode> normalizePersistedItems(TableDefinition table,
+                                                           List<PersistedItemSource> sources) {
+        Map<String, JsonNode> normalized = new HashMap<>();
+        Map<String, DynamoDbItemKey.LogicalIdentity> identitiesByStorageKey = new HashMap<>();
+        for (PersistedItemSource source : sources) {
+            for (JsonNode item : source.items().values()) {
+                DynamoDbItemKey.LogicalIdentity identity;
+                try {
+                    identity = itemKey.logicalIdentity(table, item, false);
+                } catch (AwsException e) {
+                    throw new IllegalStateException("Cannot restore DynamoDB item with an invalid primary key", e);
+                }
+                String storageKey = itemKey.storageKey(identity);
+                DynamoDbItemKey.LogicalIdentity previousIdentity = identitiesByStorageKey.putIfAbsent(storageKey, identity);
+                JsonNode previousItem = normalized.putIfAbsent(storageKey, item);
+                if (previousIdentity != null && !previousIdentity.equals(identity)) {
+                    throw new IllegalStateException("Cannot restore DynamoDB items with colliding primary keys");
+                }
+                if (previousItem != null && !previousItem.equals(item)) {
+                    throw new IllegalStateException("Cannot restore DynamoDB items with conflicting duplicate bodies");
+                }
+            }
+        }
+        return normalized;
+    }
+
+    private void persistMigratedItems(String key, Map<String, JsonNode> items, boolean accountAware) {
+        if (!accountAware) {
+            itemStore.put(key, new HashMap<>(items));
+            return;
+        }
+        int separator = key.indexOf('/');
+        if (separator <= 0 || separator == key.length() - 1) {
+            throw new IllegalStateException("Cannot persist DynamoDB item migration without an account scope");
+        }
+        ((AccountAwareStorageBackend<Map<String, JsonNode>>) itemStore).putForAccount(
+                key.substring(0, separator), key.substring(separator + 1), new HashMap<>(items));
+    }
+
+    private void persistMigratedTable(String key, TableDefinition table, boolean accountAware) {
+        if (!accountAware) {
+            tableStore.put(key, table);
+            return;
+        }
+        int separator = key.indexOf('/');
+        if (separator <= 0 || separator == key.length() - 1) {
+            throw new IllegalStateException("Cannot persist DynamoDB table migration without an account scope");
+        }
+        ((AccountAwareStorageBackend<TableDefinition>) tableStore).putForAccount(
+                key.substring(0, separator), key.substring(separator + 1), table);
     }
 
     private void persistItems(String storageKey) {
@@ -517,6 +763,9 @@ public class DynamoDbService implements ResourceProvider {
             var tableItems = itemsByTable.computeIfAbsent(scopedItemsKey(storageKey), k -> new ConcurrentSkipListMap<>());
 
             JsonNode existing = tableItems.get(itemKey);
+            if (hasDifferentIdentity(table, normalizedItem, existing, false)) {
+                throw itemKeyCollision();
+            }
 
             if (conditionExpression != null) {
                 evaluateCondition(existing, conditionExpression, exprAttrNames, exprAttrValues, returnValuesOnConditionCheckFailure);
@@ -550,6 +799,9 @@ public class DynamoDbService implements ResourceProvider {
             return null;
         }
         JsonNode item = items.get(itemKey);
+        if (hasDifferentIdentity(table, key, item, true)) {
+            return null;
+        }
         if (item != null && isExpired(item, table)) {
             LOG.tracev("Got item from {0}: key={1} item=<expired>", canonicalTableName, itemKey);
             return null;
@@ -577,9 +829,18 @@ public class DynamoDbService implements ResourceProvider {
             var items = itemsByTable.get(scopedItemsKey(storageKey));
             if (items == null) return null;
 
+            JsonNode existing = items.get(itemKey);
+            if (hasDifferentIdentity(table, key, existing, true)) {
+                if (conditionExpression != null) {
+                    evaluateCondition(null, conditionExpression, exprAttrNames, exprAttrValues,
+                            returnValuesOnConditionCheckFailure);
+                }
+                return null;
+            }
+
             if (conditionExpression != null) {
-                JsonNode existing = items.get(itemKey);
-                evaluateCondition(existing, conditionExpression, exprAttrNames, exprAttrValues, returnValuesOnConditionCheckFailure);
+                evaluateCondition(existing, conditionExpression, exprAttrNames, exprAttrValues,
+                        returnValuesOnConditionCheckFailure);
             }
 
             JsonNode removed = items.remove(itemKey);
@@ -625,6 +886,13 @@ public class DynamoDbService implements ResourceProvider {
 
             // Get existing item or create new one from key
             JsonNode existing = items.get(itemKey);
+            if (hasDifferentIdentity(table, key, existing, true)) {
+                if (conditionExpression != null) {
+                    evaluateCondition(null, conditionExpression, expressionAttrNames, expressionAttrValues,
+                            returnValuesOnConditionCheckFailure);
+                }
+                throw itemKeyCollision();
+            }
 
             if (conditionExpression != null) {
                 evaluateCondition(existing, conditionExpression, expressionAttrNames, expressionAttrValues, returnValuesOnConditionCheckFailure);
@@ -717,7 +985,7 @@ public class DynamoDbService implements ResourceProvider {
             String pkName = table.getPartitionKeyName();
             JsonNode origPk = key.get(pkName);
             JsonNode newPk = item.get(pkName);
-            if (origPk != null && newPk != null && !origPk.equals(newPk)) {
+            if (!origPk.equals(newPk)) {
                 throw new AwsException("ValidationException",
                         "One or more parameter values were invalid: Cannot update attribute " + pkName
                         + ". This attribute is part of the key", 400);
@@ -726,7 +994,7 @@ public class DynamoDbService implements ResourceProvider {
             if (skName != null) {
                 JsonNode origSk = key.get(skName);
                 JsonNode newSk = item.get(skName);
-                if (origSk != null && newSk != null && !origSk.equals(newSk)) {
+                if (!origSk.equals(newSk)) {
                     throw new AwsException("ValidationException",
                             "One or more parameter values were invalid: Cannot update attribute " + skName
                             + ". This attribute is part of the key", 400);
@@ -1023,24 +1291,93 @@ public class DynamoDbService implements ResourceProvider {
         return true;
     }
 
+    private record ItemAddress(String storageKey, String encodedKey) {}
+
+    private record ItemTarget(TableDefinition table, String storageKey, String encodedKey,
+                              DynamoDbItemKey.LogicalIdentity identity, JsonNode item, boolean put) {}
+
+    private static final Comparator<ItemTarget> ITEM_TARGET_ORDER =
+            Comparator.comparing(ItemTarget::storageKey).thenComparing(ItemTarget::encodedKey);
+
+    private ItemTarget resolveItemTarget(String tableName, JsonNode item, String region, boolean put) {
+        String canonicalTableName = canonicalTableName(region, tableName);
+        String storageKey = regionKey(region, canonicalTableName);
+        TableDefinition table = tableStore.get(storageKey)
+                .orElseThrow(() -> resourceNotFoundException(canonicalTableName));
+        DynamoDbItemKey.LogicalIdentity identity = buildItemIdentity(table, item);
+        return new ItemTarget(table, storageKey, itemKey.storageKey(identity), identity, item, put);
+    }
+
+    private void requireDistinctStorageAddresses(List<ItemTarget> targets) {
+        Map<ItemAddress, DynamoDbItemKey.LogicalIdentity> identitiesByAddress = new HashMap<>();
+        for (ItemTarget target : targets) {
+            ItemAddress address = new ItemAddress(target.storageKey(), target.encodedKey());
+            DynamoDbItemKey.LogicalIdentity previous = identitiesByAddress.putIfAbsent(address, target.identity());
+            if (previous != null && !previous.equals(target.identity())) {
+                throw itemKeyCollision();
+            }
+        }
+    }
+
+    private void requireCompatibleBatchOccupants(List<ItemTarget> targets) {
+        for (ItemTarget target : targets) {
+            if (!target.put()) {
+                continue;
+            }
+            var tableItems = itemsByTable.get(scopedItemsKey(target.storageKey()));
+            JsonNode occupant = tableItems != null ? tableItems.get(target.encodedKey()) : null;
+            if (hasDifferentIdentity(target.table(), target.item(), occupant, false)) {
+                throw itemKeyCollision();
+            }
+        }
+    }
+
     // --- Batch Operations ---
 
     public record BatchWriteResult(Map<String, List<JsonNode>> unprocessedItems) {}
 
     public BatchWriteResult batchWriteItem(Map<String, List<JsonNode>> requestItems, String region) {
+        List<ItemTarget> targets = new ArrayList<>();
         for (Map.Entry<String, List<JsonNode>> entry : requestItems.entrySet()) {
-            String tableName = canonicalTableName(region, entry.getKey());
             for (JsonNode writeRequest : entry.getValue()) {
                 if (writeRequest.has("PutRequest")) {
                     JsonNode item = writeRequest.get("PutRequest").get("Item");
-                    putItem(tableName, item, region);
+                    targets.add(resolveItemTarget(entry.getKey(), item, region, true));
                 } else if (writeRequest.has("DeleteRequest")) {
                     JsonNode key = writeRequest.get("DeleteRequest").get("Key");
-                    deleteItem(tableName, key, region);
+                    targets.add(resolveItemTarget(entry.getKey(), key, region, false));
                 }
             }
         }
-        return new BatchWriteResult(Map.of());
+        TreeMap<ItemTarget, ReentrantLock> locks = new TreeMap<>(ITEM_TARGET_ORDER);
+        for (ItemTarget target : targets) {
+            locks.putIfAbsent(target, lockFor(target.storageKey(), target.encodedKey()));
+        }
+        List<ReentrantLock> acquired = new ArrayList<>(locks.size());
+        try {
+            for (ReentrantLock lock : locks.values()) {
+                lock.lock();
+                acquired.add(lock);
+            }
+            requireDistinctStorageAddresses(targets);
+            requireCompatibleBatchOccupants(targets);
+
+            for (Map.Entry<String, List<JsonNode>> entry : requestItems.entrySet()) {
+                String tableName = canonicalTableName(region, entry.getKey());
+                for (JsonNode writeRequest : entry.getValue()) {
+                    if (writeRequest.has("PutRequest")) {
+                        putItem(tableName, writeRequest.get("PutRequest").get("Item"), region);
+                    } else if (writeRequest.has("DeleteRequest")) {
+                        deleteItem(tableName, writeRequest.get("DeleteRequest").get("Key"), region);
+                    }
+                }
+            }
+            return new BatchWriteResult(Map.of());
+        } finally {
+            for (int i = acquired.size() - 1; i >= 0; i--) {
+                acquired.get(i).unlock();
+            }
+        }
     }
 
     public record BatchGetResult(Map<String, List<JsonNode>> responses, Map<String, JsonNode> unprocessedKeys) {}
@@ -1079,123 +1416,158 @@ public class DynamoDbService implements ResourceProvider {
 
     public void transactWriteItems(List<JsonNode> transactItems, String region,
                                     String clientRequestToken, JsonNode rawRequest) {
-        // Idempotency check via ClientRequestToken — AWS contract:
-        //   * Same token + identical request body  → no-op success (silently dedupe).
-        //   * Same token + different request body  → IdempotentParameterMismatchException.
-        //   * No token, or expired token           → proceed normally.
-        if (clientRequestToken != null && !clientRequestToken.isEmpty() && rawRequest != null) {
-            String cacheKey = regionResolver.getAccountId() + "::" + region + "::" + clientRequestToken;
-            String requestHash = sha256(rawRequest.toString());
-            long nowNanos = System.nanoTime();
-
-            IdempotencyEntry existing = txIdempotency.get(cacheKey);
-            if (existing != null && nowNanos - existing.insertedAtNanos() <= TX_IDEMPOTENCY_TTL_NANOS) {
-                if (existing.requestHash().equals(requestHash)) {
-                    LOG.debugv("transactWriteItems: idempotent replay for token={0}", clientRequestToken);
-                    return;
-                }
-                throw new AwsException("IdempotentParameterMismatchException",
-                        "Request parameters do not match those of an in-flight or recent transaction using the same ClientRequestToken",
-                        400);
-            }
-
-            // Register the token. compute() is used so a concurrent replay with the same body
-            // collapses onto the same entry without double-applying writes.
-            IdempotencyEntry registered = txIdempotency.compute(cacheKey, (k, v) -> {
-                if (v != null && nowNanos - v.insertedAtNanos() <= TX_IDEMPOTENCY_TTL_NANOS) {
-                    return v;
-                }
-                return new IdempotencyEntry(requestHash, nowNanos);
-            });
-            if (!registered.requestHash().equals(requestHash)) {
-                throw new AwsException("IdempotentParameterMismatchException",
-                        "Request parameters do not match those of an in-flight or recent transaction using the same ClientRequestToken",
-                        400);
-            }
-            if (registered.insertedAtNanos() != nowNanos) {
-                // Lost the race to a concurrent identical request — treat as a replay.
-                LOG.debugv("transactWriteItems: concurrent identical replay for token={0}", clientRequestToken);
-                return;
-            }
-
-            // Best-effort eviction of stale entries.
-            txIdempotency.entrySet().removeIf(e -> nowNanos - e.getValue().insertedAtNanos() > TX_IDEMPOTENCY_TTL_NANOS);
+        TransactionIdempotency idempotency = prepareTransactionIdempotency(
+                clientRequestToken, rawRequest, region);
+        if (idempotency.replay()) {
+            return;
         }
 
-
-        // Acquire every participant's item lock in a deterministic (storageKey, itemKey)
-        // order before evaluating conditions or applying writes. Total-ordered acquisition
-        // prevents deadlock across concurrent transactions; ReentrantLock lets the inner
-        // putItem/updateItem/deleteItem calls re-enter the same lock for free.
-        //
-        // Ordering uses a tuple comparator — not a delimited string — so user-supplied
-        // bytes in an item's PK/SK value cannot collide two distinct participants
-        // into the same ordering key.
-        TreeMap<TransactParticipant, ReentrantLock> toAcquire = new TreeMap<>(PARTICIPANT_ORDER);
-        for (JsonNode transactItem : transactItems) {
-            TransactParticipant p = resolveParticipant(transactItem, region);
-            if (p == null) continue;
-            toAcquire.putIfAbsent(p, lockFor(p.storageKey, p.itemKey));
-        }
-
-        List<ReentrantLock> acquired = new ArrayList<>(toAcquire.size());
         try {
-            for (ReentrantLock lock : toAcquire.values()) {
-                lock.lock();
-                acquired.add(lock);
+            // Acquire every participant's item lock in a deterministic (storageKey, itemKey)
+            // order before evaluating conditions or applying writes. Total-ordered acquisition
+            // prevents deadlock across concurrent transactions; ReentrantLock lets the inner
+            // putItem/updateItem/deleteItem calls re-enter the same lock for free.
+            //
+            // Ordering uses a tuple comparator — not a delimited string — so user-supplied
+            // bytes in an item's PK/SK value cannot collide two distinct participants
+            // into the same ordering key.
+            TreeMap<TransactParticipant, ReentrantLock> toAcquire = new TreeMap<>(PARTICIPANT_ORDER);
+            Map<ItemAddress, DynamoDbItemKey.LogicalIdentity> identitiesByAddress = new HashMap<>();
+            for (JsonNode transactItem : transactItems) {
+                TransactParticipant p = resolveParticipant(transactItem, region);
+                if (p == null) {
+                    continue;
+                }
+                ItemAddress address = new ItemAddress(p.storageKey(), p.itemKey());
+                DynamoDbItemKey.LogicalIdentity previous = identitiesByAddress.putIfAbsent(address, p.identity());
+                if (previous != null && !previous.equals(p.identity())) {
+                    throw itemKeyCollision();
+                }
+                toAcquire.putIfAbsent(p, lockFor(p.storageKey, p.itemKey));
             }
 
-            // First pass: evaluate all conditions and collect failures.
-            List<TransactionCanceledException.CancellationReason> cancellationReasons = new ArrayList<>();
-            boolean hasFailed = false;
-            for (JsonNode transactItem : transactItems) {
-                TransactionCanceledException.CancellationReason failReason = evaluateTransactCondition(transactItem, region);
-                if (failReason != null) {
-                    hasFailed = true;
-                    cancellationReasons.add(failReason);
-                } else {
-                    cancellationReasons.add(new TransactionCanceledException.CancellationReason("", null));
+            List<ReentrantLock> acquired = new ArrayList<>(toAcquire.size());
+            try {
+                for (ReentrantLock lock : toAcquire.values()) {
+                    lock.lock();
+                    acquired.add(lock);
+                }
+
+                // First pass: evaluate all conditions and collect failures.
+                List<TransactionCanceledException.CancellationReason> cancellationReasons = new ArrayList<>();
+                boolean hasFailed = false;
+                for (JsonNode transactItem : transactItems) {
+                    TransactionCanceledException.CancellationReason failReason = evaluateTransactCondition(transactItem, region);
+                    if (failReason != null) {
+                        hasFailed = true;
+                        cancellationReasons.add(failReason);
+                    } else {
+                        cancellationReasons.add(new TransactionCanceledException.CancellationReason("", null));
+                    }
+                }
+
+                if (hasFailed) {
+                    throw new TransactionCanceledException(cancellationReasons);
+                }
+
+                // Second pass: apply all writes. Inner methods re-acquire their own locks,
+                // which is a no-op thanks to ReentrantLock.
+                for (JsonNode transactItem : transactItems) {
+                    if (transactItem.has("Put")) {
+                        JsonNode put = transactItem.get("Put");
+                        String tableName = put.path("TableName").asText();
+                        JsonNode item = put.get("Item");
+                        putItem(tableName, item, region);
+                    } else if (transactItem.has("Delete")) {
+                        JsonNode del = transactItem.get("Delete");
+                        String tableName = del.path("TableName").asText();
+                        JsonNode key = del.get("Key");
+                        deleteItem(tableName, key, region);
+                    } else if (transactItem.has("Update")) {
+                        JsonNode upd = transactItem.get("Update");
+                        String tableName = upd.path("TableName").asText();
+                        JsonNode key = upd.get("Key");
+                        String updateExpression = upd.has("UpdateExpression") ? upd.get("UpdateExpression").asText() : null;
+                        JsonNode exprAttrNames = upd.has("ExpressionAttributeNames") ? upd.get("ExpressionAttributeNames") : null;
+                        JsonNode exprAttrValues = upd.has("ExpressionAttributeValues") ? upd.get("ExpressionAttributeValues") : null;
+                        //there is no ConditionExpression, so setting returnValuesOnConditionCheckFailure = "NONE"
+                        updateItem(tableName, key, null, updateExpression, exprAttrNames, exprAttrValues,
+                                   "NONE", null, region, "NONE");
+                    }
+                    // ConditionCheck-only items are handled in the first pass only
+                }
+            } finally {
+                for (int i = acquired.size() - 1; i >= 0; i--) {
+                    acquired.get(i).unlock();
                 }
             }
-
-            if (hasFailed) {
-                throw new TransactionCanceledException(cancellationReasons);
-            }
-
-            // Second pass: apply all writes. Inner methods re-acquire their own locks,
-            // which is a no-op thanks to ReentrantLock.
-            for (JsonNode transactItem : transactItems) {
-                if (transactItem.has("Put")) {
-                    JsonNode put = transactItem.get("Put");
-                    String tableName = put.path("TableName").asText();
-                    JsonNode item = put.get("Item");
-                    putItem(tableName, item, region);
-                } else if (transactItem.has("Delete")) {
-                    JsonNode del = transactItem.get("Delete");
-                    String tableName = del.path("TableName").asText();
-                    JsonNode key = del.get("Key");
-                    deleteItem(tableName, key, region);
-                } else if (transactItem.has("Update")) {
-                    JsonNode upd = transactItem.get("Update");
-                    String tableName = upd.path("TableName").asText();
-                    JsonNode key = upd.get("Key");
-                    String updateExpression = upd.has("UpdateExpression") ? upd.get("UpdateExpression").asText() : null;
-                    JsonNode exprAttrNames = upd.has("ExpressionAttributeNames") ? upd.get("ExpressionAttributeNames") : null;
-                    JsonNode exprAttrValues = upd.has("ExpressionAttributeValues") ? upd.get("ExpressionAttributeValues") : null;
-                    //there is no ConditionExpression, so setting returnValuesOnConditionCheckFailure = "NONE"
-                    updateItem(tableName, key, null, updateExpression, exprAttrNames, exprAttrValues,
-                               "NONE", null, region, "NONE");
-                }
-                // ConditionCheck-only items are handled in the first pass only
-            }
-        } finally {
-            for (int i = acquired.size() - 1; i >= 0; i--) {
-                acquired.get(i).unlock();
-            }
+            completeTransactionIdempotency(idempotency);
+        } catch (RuntimeException | Error failure) {
+            failTransactionIdempotency(idempotency, failure);
+            throw failure;
         }
     }
 
-    private record TransactParticipant(String storageKey, String itemKey) {}
+    private TransactionIdempotency prepareTransactionIdempotency(String clientRequestToken,
+                                                                  JsonNode rawRequest, String region) {
+        if (clientRequestToken == null || clientRequestToken.isEmpty() || rawRequest == null) {
+            return new TransactionIdempotency(null, false);
+        }
+        String cacheKey = regionResolver.getAccountId() + "::" + region + "::" + clientRequestToken;
+        String requestHash = sha256(rawRequest.toString());
+        long nowNanos = System.nanoTime();
+        AtomicBoolean owner = new AtomicBoolean();
+        IdempotencyEntry entry = txIdempotency.compute(cacheKey, (key, existing) -> {
+            if (existing != null && nowNanos - existing.insertedAtNanos() <= TX_IDEMPOTENCY_TTL_NANOS) {
+                return existing;
+            }
+            owner.set(true);
+            return new IdempotencyEntry(requestHash, nowNanos, new CompletableFuture<>());
+        });
+        if (!entry.requestHash().equals(requestHash)) {
+            throw new AwsException("IdempotentParameterMismatchException",
+                    "Request parameters do not match those of an in-flight or recent transaction using the same ClientRequestToken",
+                    400);
+        }
+        if (!owner.get()) {
+            awaitTransactionIdempotency(entry);
+            LOG.debugv("transactWriteItems: idempotent replay for token={0}", clientRequestToken);
+            return new TransactionIdempotency(null, true);
+        }
+        txIdempotency.entrySet().removeIf(candidate ->
+                nowNanos - candidate.getValue().insertedAtNanos() > TX_IDEMPOTENCY_TTL_NANOS);
+        return new TransactionIdempotency(entry, false);
+    }
+
+    private void awaitTransactionIdempotency(IdempotencyEntry entry) {
+        try {
+            entry.completion().join();
+        } catch (CompletionException e) {
+            Throwable failure = e.getCause();
+            if (failure instanceof RuntimeException exception) {
+                throw exception;
+            }
+            if (failure instanceof Error error) {
+                throw error;
+            }
+            throw e;
+        }
+    }
+
+    private void completeTransactionIdempotency(TransactionIdempotency idempotency) {
+        if (idempotency.entry() != null) {
+            idempotency.entry().completion().complete(null);
+        }
+    }
+
+    private void failTransactionIdempotency(TransactionIdempotency idempotency, Throwable failure) {
+        if (idempotency.entry() != null) {
+            idempotency.entry().completion().completeExceptionally(failure);
+        }
+    }
+
+    private record TransactParticipant(String storageKey, String itemKey,
+                                       DynamoDbItemKey.LogicalIdentity identity) {}
 
     private static final Comparator<TransactParticipant> PARTICIPANT_ORDER =
             Comparator.comparing(TransactParticipant::storageKey)
@@ -1226,8 +1598,8 @@ public class DynamoDbService implements ResourceProvider {
         String storageKey = regionKey(region, tableName);
         TableDefinition table = tableStore.get(storageKey)
                 .orElseThrow(() -> resourceNotFoundException(tableName));
-        String itemKey = buildItemKey(table, keyOrItem);
-        return new TransactParticipant(storageKey, itemKey);
+        DynamoDbItemKey.LogicalIdentity identity = buildItemIdentity(table, keyOrItem);
+        return new TransactParticipant(storageKey, itemKey.storageKey(identity), identity);
     }
 
     private TransactionCanceledException.CancellationReason evaluateTransactCondition(JsonNode transactItem, String region) {
@@ -1246,15 +1618,13 @@ public class DynamoDbService implements ResourceProvider {
 
         String conditionExpression = target.has("ConditionExpression")
                 ? target.get("ConditionExpression").asText() : null;
-        if (conditionExpression == null) {
-            return null;
-        }
         String returnValuesOnConditionCheckFailure = target.has("ReturnValuesOnConditionCheckFailure")
                 ? target.get("ReturnValuesOnConditionCheckFailure").asText() : null;
 
         String tableName = target.path("TableName").asText();
         String canonicalTableName = canonicalTableName(region, tableName);
-        JsonNode key = transactItem.has("Put") ? target.get("Item") : target.get("Key");
+        boolean put = transactItem.has("Put");
+        JsonNode key = put ? target.get("Item") : target.get("Key");
         JsonNode exprAttrNames = target.has("ExpressionAttributeNames") ? target.get("ExpressionAttributeNames") : null;
         JsonNode exprAttrValues = target.has("ExpressionAttributeValues") ? target.get("ExpressionAttributeValues") : null;
 
@@ -1265,6 +1635,12 @@ public class DynamoDbService implements ResourceProvider {
         String itemKey = buildItemKey(table, key);
         var tableItems = itemsByTable.get(scopedItemsKey(storageKey));
         JsonNode existing = tableItems != null ? tableItems.get(itemKey) : null;
+        if (hasDifferentIdentity(table, key, existing, !put)) {
+            return new TransactionCanceledException.CancellationReason("ValidationError", null);
+        }
+        if (conditionExpression == null) {
+            return null;
+        }
 
         try {
             evaluateCondition(existing, conditionExpression, exprAttrNames, exprAttrValues, returnValuesOnConditionCheckFailure);
@@ -2533,47 +2909,26 @@ public class DynamoDbService implements ResourceProvider {
         }
     }
 
+    private boolean hasDifferentIdentity(TableDefinition table, JsonNode requested, JsonNode occupant,
+                                         boolean isKeyArgument) {
+        return occupant != null && !itemKey.hasSameIdentity(table, requested, occupant, isKeyArgument);
+    }
+
+    private AwsException itemKeyCollision() {
+        return new AwsException("ValidationException",
+                "One or more parameter values were invalid: DynamoDB item key collides with a different item", 400);
+    }
+
     String buildItemKey(TableDefinition table, JsonNode item) {
         return buildItemKey(table, item, false);
     }
 
     String buildItemKey(TableDefinition table, JsonNode item, boolean isKeyArg) {
-        String pkName = table.getPartitionKeyName();
-        JsonNode pkAttr = item.get(pkName);
-        if (pkAttr == null) {
-            if (isKeyArg) {
-                throw new AwsException("ValidationException",
-                        "The provided key element does not match the schema", 400);
-            }
-            throw new AwsException("ValidationException",
-                    "One of the required keys was not given a value", 400);
-        }
-        validateKeyAttributeValue(pkAttr, pkName);
-
-        String pk = extractScalarValue(pkAttr);
-        String skName = table.getSortKeyName();
-        if (skName != null) {
-            JsonNode skAttr = item.get(skName);
-            if (skAttr == null) {
-                if (isKeyArg) {
-                    throw new AwsException("ValidationException",
-                            "The provided key element does not match the schema", 400);
-                }
-                throw new AwsException("ValidationException",
-                        "One of the required keys was not given a value", 400);
-            }
-            validateKeyAttributeValue(skAttr, skName);
-            return pk + "#" + extractScalarValue(skAttr);
-        }
-        return pk;
+        return itemKey.storageKey(table, item, isKeyArg);
     }
 
-    private void validateKeyAttributeValue(JsonNode attr, String keyName) {
-        if (attr != null && attr.has("S") && attr.get("S").asText().isEmpty()) {
-            throw new AwsException("ValidationException",
-                    "One or more parameter values were invalid: "
-                    + "The AttributeValue for a key attribute cannot contain an empty string value. Key: " + keyName, 400);
-        }
+    DynamoDbItemKey.LogicalIdentity buildItemIdentity(TableDefinition table, JsonNode item) {
+        return itemKey.logicalIdentity(table, item, false);
     }
 
     private String buildItemKeyFromNode(JsonNode item, String pkName, String skName) {
@@ -2586,16 +2941,19 @@ public class DynamoDbService implements ResourceProvider {
     // skip or duplicate items. See floci-io/floci#1675.
     private String buildItemKeyFromNode(JsonNode item, String pkName, List<String> skNames) {
         JsonNode pkAttr = item.get(pkName);
-        if (pkAttr == null) return "";
-        String pk = extractScalarValue(pkAttr);
-        StringBuilder key = new StringBuilder(pk != null ? pk : "");
+        if (pkAttr == null) {
+            return "";
+        }
+        List<String> components = new ArrayList<>();
+        String partitionValue = extractScalarValue(pkAttr);
+        components.add(partitionValue != null ? partitionValue : "");
         for (String skName : skNames) {
             JsonNode skAttr = item.get(skName);
             if (skAttr != null) {
-                key.append("#").append(extractScalarValue(skAttr));
+                components.add(extractScalarValue(skAttr));
             }
         }
-        return key.toString();
+        return itemKey.cursorKey(components.getFirst(), components.subList(1, components.size()).toArray(String[]::new));
     }
 
     JsonNode buildKeyNode(TableDefinition table, JsonNode item, String pkName, String skName) {
@@ -2640,16 +2998,7 @@ public class DynamoDbService implements ResourceProvider {
     }
 
     private String extractScalarValue(JsonNode attrValue) {
-        if (attrValue == null) return null;
-        if (attrValue.has("S")) return attrValue.get("S").asText();
-        if (attrValue.has("N")) {
-            String raw = attrValue.get("N").asText();
-            try { return DynamoDbNumberUtils.validateAndNormalize(raw); }
-            catch (Exception e) { return raw; }
-        }
-        if (attrValue.has("B")) return attrValue.get("B").asText();
-        if (attrValue.has("BOOL")) return attrValue.get("BOOL").asText();
-        return attrValue.asText();
+        return DynamoDbItemKey.canonicalScalarValue(attrValue);
     }
 
     private boolean matchesAttributeValue(JsonNode attrValue, String expected) {

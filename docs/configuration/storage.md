@@ -59,6 +59,14 @@ When not set for a service, it inherits `FLOCI_STORAGE_MODE`. Only override when
     instance is deleted. In other modes the volume is retained unless
     `FLOCI_STORAGE_PRUNE_VOLUMES_ON_DELETE=true`.
 
+## DynamoDB Composite Item Keys
+
+Composite DynamoDB table items are stored under their canonical partition-key value, the exact `FLOCI_SERVICES_DYNAMODB_ITEM_KEY_DELIMITER` literal, and their canonical sort-key value. The default is `#`. The delimiter is not a regular expression and is not trimmed, so values such as `::` and `.*` are used exactly as supplied. HASH-only tables retain their bare partition-key storage entry.
+
+When durable DynamoDB data is loaded, Floci derives every composite map key from the item body and the table definition. It plans the complete migration before writing any map. Equivalent duplicate bodies for one logical identity are deduplicated; missing keys, conflicting duplicate bodies, or two distinct identities that would use one configured storage address stop startup without rewriting the item maps. This cannot recover an item that an older delimiter collision had already overwritten.
+
+Before changing the delimiter, stop Floci and back up the persistent storage directory. Do not run mixed Floci versions against the same storage. To return to an older binary that only understands `#`, first start a current binary with `FLOCI_SERVICES_DYNAMODB_ITEM_KEY_DELIMITER=#` and let it normalize the data, then stop it before starting the older binary. This procedure applies to `persistent`, `hybrid`, and `wal` modes; do not edit WAL files while Floci is running.
+
 ## Recommended Profiles
 
 === "Fast CI"

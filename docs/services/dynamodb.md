@@ -52,6 +52,7 @@ DynamoDB Streams are supported via a separate target (`DynamoDBStreams_20120810`
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_DYNAMODB_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_DYNAMODB_ITEM_KEY_DELIMITER` | `#` | Literal separator used for persisted composite primary-key map entries. It must not be empty. |
 | `FLOCI_STORAGE_SERVICES_DYNAMODB_MODE` | *(global default)* | Storage mode override for DynamoDB (`memory`, `persistent`, `hybrid`, `wal`) |
 | `FLOCI_STORAGE_SERVICES_DYNAMODB_FLUSH_INTERVAL_MS` | `5000` | Flush interval for `hybrid`/`wal` storage modes (milliseconds) |
 

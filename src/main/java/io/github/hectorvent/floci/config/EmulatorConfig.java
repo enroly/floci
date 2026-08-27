@@ -916,6 +916,9 @@ public interface EmulatorConfig {
     interface DynamoDbServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        @WithDefault("#")
+        String itemKeyDelimiter();
     }
 
     interface SnsServiceConfig {
