@@ -467,6 +467,22 @@ class LambdaServiceTest {
     }
 
     @Test
+    void createProvidedRuntimeFunctionUsesBootstrapRegardlessOfHandler() throws Exception {
+        Map<String, Object> request = new java.util.HashMap<>(Map.of(
+                "FunctionName", "provided-runtime-function",
+                "Runtime", "provided.al2",
+                "Role", "arn:aws:iam::000000000000:role/test-role",
+                "Handler", "hello.handler",
+                "Code", Map.of("ZipFile", createZipBase64("bootstrap"))
+        ));
+
+        LambdaFunction function = service.createFunction(REGION, request);
+
+        assertEquals("provided.al2", function.getRuntime());
+        assertEquals("hello.handler", function.getHandler());
+    }
+
+    @Test
     void createFunctionWithMissingHandler() throws Exception {
         Map<String, Object> req = new java.util.HashMap<>(Map.of(
                 "FunctionName", "missing-handler-fn",
