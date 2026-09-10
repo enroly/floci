@@ -4,9 +4,6 @@ Thank you for your interest in contributing! Floci is a community-driven project
 
 **Join us on [Slack](https://join.slack.com/t/floci/shared_invite/zt-3tjn02s3q-A00kEjJ1cZxsg_imTfy6Cw)** — it is the fastest way to reach maintainers. Ask about AWS behaviour, sanity-check an approach before you build it, or get unstuck on a PR.
 
-> [!IMPORTANT]
-> This repository is Enroly's controlled integration fork. Before contributing here, read the [Enroly integration maintenance guide](docs/enroly-integration.md). Fork work requires a reviewed pull request in this repository, and no upstream pull request should be opened unless explicitly requested. Inherited ownership and pull request checks remain active until maintainers explicitly reconcile fork policy; do not bypass or suppress them.
-
 ## Ways to Contribute
 
 - **Bug reports** — open an issue with a minimal reproduction
