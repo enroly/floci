@@ -20,12 +20,14 @@ aliases:
   kafka: msk                            # MSK's SigV4 signing name is "kafka"
   mq: amazonmq                          # Amazon MQ's SigV4 signing name is "mq"
   signin: iam                           # AWS Sign-In facet, at iam.md#aws-sign-in-login-credentials
+  sso: iam                              # Identity Center ListInstances facet on the IAM page
   events: eventbridge
   servicediscovery: cloudmap            # Cloud Map's SigV4 signing name
   elasticmapreduce: emr                 # EMR's SigV4 signing name
   logs: cloudwatch                      # CloudWatch Logs facet, at cloudwatch.md
   monitoring: cloudwatch                # CloudWatch Metrics facet, at cloudwatch.md#metrics
   secretsmanager: secrets-manager
+  servicecatalog: service-catalog
   cognito-idp: cognito                  # Cognito's SigV4 signing name
   states: step-functions                # Step Functions' SigV4 signing name
   email: ses                            # SES's SigV4 signing name
@@ -37,6 +39,7 @@ aliases:
   elasticbeanstalk: elastic-beanstalk
   ec2messages: ssm                      # SSM Messages facet, documented alongside ssm.md
   iotdata: iot                          # IoT Data row shares iot.md with IoT Core
+  resource-explorer-2: resource-explorer # API version suffix; the page is resource-explorer.md
 
 # A NEW switch/REST descriptor not listed here and not resolvable via an alias fails
 # `--strict`. Every entry MUST carry a `by:` expiry date (ISO, YYYY-MM-DD): once that

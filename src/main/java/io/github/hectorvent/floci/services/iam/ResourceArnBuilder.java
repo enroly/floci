@@ -1,7 +1,9 @@
 package io.github.hectorvent.floci.services.iam;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
 
 /**
@@ -13,6 +15,13 @@ import jakarta.ws.rs.container.ContainerRequestContext;
  */
 @ApplicationScoped
 public class ResourceArnBuilder {
+
+    private final ObjectMapper objectMapper;
+
+    @Inject
+    public ResourceArnBuilder(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
 
     public String build(String credentialScope, ContainerRequestContext ctx,
                         String region, String accountId) {
@@ -60,8 +69,10 @@ public class ResourceArnBuilder {
     private String buildSqsArn(ContainerRequestContext ctx, String region, String accountId) {
         String queueUrl = ctx.getUriInfo().getQueryParameters().getFirst("QueueUrl");
         if (queueUrl == null) {
-            // Try form param for Query-protocol
-            queueUrl = firstFormParam(ctx, "QueueUrl");
+            queueUrl = RequestBodyReader.formField(ctx, "QueueUrl");
+        }
+        if (queueUrl == null) {
+            queueUrl = RequestBodyReader.jsonField(ctx, objectMapper, "QueueUrl");
         }
         if (queueUrl != null) {
             String queueName = queueUrl.substring(queueUrl.lastIndexOf('/') + 1);
@@ -72,32 +83,42 @@ public class ResourceArnBuilder {
 
     // ── SNS ─────────────────────────────────────────────────────────────────────
     private String buildSnsArn(ContainerRequestContext ctx, String region, String accountId) {
-        String topicArn = firstFormParam(ctx, "TopicArn");
+        String topicArn = RequestBodyReader.formField(ctx, "TopicArn");
+        if (topicArn == null) {
+            topicArn = RequestBodyReader.jsonField(ctx, objectMapper, "TopicArn");
+        }
         return topicArn != null ? topicArn : AwsArnUtils.Arn.of("sns", region, accountId, "*").toString();
     }
 
     // ── DynamoDB ─────────────────────────────────────────────────────────────────
     private String buildDynamoDbArn(ContainerRequestContext ctx, String region, String accountId) {
-        // TableName comes in the JSON body; use wildcard since we don't parse the body here
-        return AwsArnUtils.Arn.of("dynamodb", region, accountId, "table/*").toString();
+        String tableName = RequestBodyReader.jsonField(ctx, objectMapper, "TableName");
+        if (tableName == null || tableName.isBlank()) {
+            return AwsArnUtils.Arn.of("dynamodb", region, accountId, "table/*").toString();
+        }
+        return AwsArnUtils.Arn.of("dynamodb", region, accountId, "table/" + tableName).toString();
     }
 
-    // ── Kinesis ──────────────────────────────────────────────────────────────────
     private String buildKinesisArn(ContainerRequestContext ctx, String region, String accountId) {
         return AwsArnUtils.Arn.of("kinesis", region, accountId, "stream/*").toString();
     }
 
     // ── Secrets Manager ──────────────────────────────────────────────────────────
     private String buildSecretsManagerArn(ContainerRequestContext ctx, String region, String accountId) {
-        return AwsArnUtils.Arn.of("secretsmanager", region, accountId, "secret:*").toString();
+        String secretId = RequestBodyReader.jsonField(ctx, objectMapper, "SecretId");
+        if (secretId == null || secretId.isBlank()) {
+            return AwsArnUtils.Arn.of("secretsmanager", region, accountId, "secret:*").toString();
+        }
+        if (secretId.startsWith("arn:")) {
+            return secretId;
+        }
+        return AwsArnUtils.Arn.of("secretsmanager", region, accountId, "secret:" + secretId).toString();
     }
 
-    // ── SSM ──────────────────────────────────────────────────────────────────────
     private String buildSsmArn(ContainerRequestContext ctx, String region, String accountId) {
         return AwsArnUtils.Arn.of("ssm", region, accountId, "parameter/*").toString();
     }
 
-    // ── KMS ──────────────────────────────────────────────────────────────────────
     private String buildKmsArn(String path, String region, String accountId) {
         String keyId = extractSegmentAfter(path, "keys");
         if (keyId == null) return AwsArnUtils.Arn.of("kms", region, accountId, "key/*").toString();
@@ -116,9 +137,4 @@ public class ResourceArnBuilder {
         return slash > 0 ? after.substring(0, slash) : after;
     }
 
-    private String firstFormParam(ContainerRequestContext ctx, String name) {
-        // Form params are typically available as query params in REST-Assured / JAX-RS
-        String v = ctx.getUriInfo().getQueryParameters().getFirst(name);
-        return v;
-    }
 }

@@ -78,6 +78,26 @@ class LambdaServiceTest {
     }
 
     @Test
+    void configurationOnlyUpdateDrainsTheLatestExecutionEnvironment() {
+        WarmPool warmPool = mock(WarmPool.class);
+        LambdaService configuredService = new LambdaService(
+                new LambdaFunctionStore(new InMemoryStorage<String, LambdaFunction>()),
+                warmPool, new CodeStore(Path.of("target/test-data/lambda-config-code")),
+                new ZipExtractor(), new RegionResolver(REGION, "000000000000"));
+        LambdaFunction created = configuredService.createFunction(REGION, baseRequest("config-function"));
+        String functionArn = created.getFunctionArn();
+        clearInvocations(warmPool);
+
+        LambdaFunction updated = configuredService.updateFunctionConfiguration(REGION, "config-function",
+                Map.of("Environment", Map.of("Variables", Map.of("LOCAL_ENDPOINT", "http://emulator:4566"))));
+
+        assertEquals(Map.of("LOCAL_ENDPOINT", "http://emulator:4566"), updated.getEnvironment());
+        assertEquals(functionArn, updated.getFunctionArn());
+        verify(warmPool).drainEnvironment(updated);
+        verify(warmPool, never()).drainFunction(anyString());
+    }
+
+    @Test
     void createAndUpdateFunctionFileSystemConfig() {
         Map<String, Object> request = baseRequest("efs-function");
         request.put("VpcConfig", vpcConfig());
@@ -464,6 +484,22 @@ class LambdaServiceTest {
         ));
         LambdaFunction fn = service.createFunction(REGION, req);
         assertEquals("apps.foo.src.lambda_handler.lambda_handler", fn.getHandler());
+    }
+
+    @Test
+    void createProvidedRuntimeFunctionUsesBootstrapRegardlessOfHandler() throws Exception {
+        Map<String, Object> request = new java.util.HashMap<>(Map.of(
+                "FunctionName", "provided-runtime-function",
+                "Runtime", "provided.al2",
+                "Role", "arn:aws:iam::000000000000:role/test-role",
+                "Handler", "hello.handler",
+                "Code", Map.of("ZipFile", createZipBase64("bootstrap"))
+        ));
+
+        LambdaFunction function = service.createFunction(REGION, request);
+
+        assertEquals("provided.al2", function.getRuntime());
+        assertEquals("hello.handler", function.getHandler());
     }
 
     @Test

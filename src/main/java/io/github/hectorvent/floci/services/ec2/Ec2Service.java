@@ -20,6 +20,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -31,6 +32,9 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -95,7 +99,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 @ApplicationScoped
-public class Ec2Service implements ContainerTeardown {
+public class Ec2Service implements ContainerTeardown, ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(Ec2Service.class);
     private static final DateTimeFormatter ISO_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
@@ -1888,6 +1892,15 @@ public class Ec2Service implements ContainerTeardown {
         return applyRouteFilters(routes, filters);
     }
 
+    /** No real S3 write — returns a location string (unique random suffix) matching the export naming AWS uses. */
+    public String exportTransitGatewayRoutes(String region, String routeTableId, String s3Bucket) {
+        getRequiredTransitGatewayRouteTable(region, routeTableId);
+        if (s3Bucket == null || s3Bucket.isBlank()) {
+            throw new AwsException("MissingParameter", "S3Bucket is required.", 400);
+        }
+        return "s3://" + s3Bucket + "/" + routeTableId + "-" + randomHex(8) + ".csv";
+    }
+
     /**
      * The route search filters, as the live API applies them. The three CIDR relationship filters
      * differ in the value they take, which is not something the reference spells out:
@@ -2734,7 +2747,8 @@ public class Ec2Service implements ContainerTeardown {
 
     public VpcEndpoint createVpcEndpoint(String region, String vpcId, String serviceName, String endpointType,
                                          List<String> routeTableIds, List<String> subnetIds,
-                                         List<String> securityGroupIds, Boolean privateDnsEnabled, List<Tag> endpointTags) {
+                                         List<String> securityGroupIds, Boolean privateDnsEnabled,
+                                         String policyDocument, List<Tag> endpointTags) {
         ensureDefaultResources(region);
         getRequiredVpc(region, vpcId);
         for (String routeTableId : routeTableIds) {
@@ -2759,12 +2773,96 @@ public class Ec2Service implements ContainerTeardown {
         endpoint.setRouteTableIds(new ArrayList<>(routeTableIds));
         endpoint.setSubnetIds(new ArrayList<>(subnetIds));
         endpoint.setSecurityGroupIds(new ArrayList<>(securityGroupIds));
+        endpoint.setPolicyDocument(policyDocument);
         if (endpointTags != null && !endpointTags.isEmpty()) {
             endpoint.setTags(new ArrayList<>(endpointTags));
             tags.put(endpoint.getVpcEndpointId(), new ArrayList<>(endpointTags));
         }
         vpcEndpoints.put(key(region, endpoint.getVpcEndpointId()), endpoint);
         return endpoint;
+    }
+
+    /**
+     * Applies a ModifyVpcEndpoint request. Every parameter is optional and each applies
+     * independently, so one request may move route tables and rewrite the policy.
+     *
+     * <p>The add/remove parameters are set operations. AWS accepts an id that is already
+     * associated, or a removal of one that is not, without complaint, so this is
+     * idempotent on both sides. {@code resetPolicy} returns the endpoint to the default
+     * full-access policy, modelled here as carrying no document at all.
+     */
+    public VpcEndpoint modifyVpcEndpoint(String region, String endpointId,
+                                         List<String> addRouteTableIds, List<String> removeRouteTableIds,
+                                         List<String> addSubnetIds, List<String> removeSubnetIds,
+                                         List<String> addSecurityGroupIds, List<String> removeSecurityGroupIds,
+                                         String policyDocument, Boolean resetPolicy, Boolean privateDnsEnabled) {
+        // VpcEndpointId is the one required member of ModifyVpcEndpointRequest. The model
+        // requires it to be present, not to be non-empty, so only an absent value is a
+        // MissingParameter; a present-but-unknown id is an InvalidVpcEndpointId.NotFound.
+        if (endpointId == null) {
+            throw new AwsException("MissingParameter",
+                    "The request must contain the parameter VpcEndpointId", 400);
+        }
+        ensureDefaultResources(region);
+        // Terraform declares each aws_vpc_endpoint_route_table_association as its own
+        // resource and applies them in parallel, so several ModifyVpcEndpoint calls land
+        // on one endpoint at once. Without the lock this read-modify-write loses updates:
+        // each caller reads the same association list, adds its own id, and the last write
+        // wins -- leaving the other caller's waiter polling for an association that was
+        // silently dropped.
+        synchronized (lockFor(key(region, endpointId))) {
+            return modifyVpcEndpointLocked(region, endpointId,
+                    addRouteTableIds, removeRouteTableIds, addSubnetIds, removeSubnetIds,
+                    addSecurityGroupIds, removeSecurityGroupIds,
+                    policyDocument, resetPolicy, privateDnsEnabled);
+        }
+    }
+
+    private VpcEndpoint modifyVpcEndpointLocked(String region, String endpointId,
+                                                List<String> addRouteTableIds, List<String> removeRouteTableIds,
+                                                List<String> addSubnetIds, List<String> removeSubnetIds,
+                                                List<String> addSecurityGroupIds, List<String> removeSecurityGroupIds,
+                                                String policyDocument, Boolean resetPolicy,
+                                                Boolean privateDnsEnabled) {
+        VpcEndpoint endpoint = getRequiredVpcEndpoint(region, endpointId);
+
+        // Validate every referenced id before mutating anything, so a request naming one
+        // bad id does not leave the endpoint half-modified.
+        for (String routeTableId : addRouteTableIds) {
+            getRequiredRouteTable(region, routeTableId);
+        }
+        for (String subnetId : addSubnetIds) {
+            requireSubnet(region, subnetId);
+        }
+        for (String securityGroupId : addSecurityGroupIds) {
+            getRequiredSecurityGroup(region, securityGroupId);
+        }
+
+        applyIdChanges(endpoint.getRouteTableIds(), addRouteTableIds, removeRouteTableIds);
+        applyIdChanges(endpoint.getSubnetIds(), addSubnetIds, removeSubnetIds);
+        applyIdChanges(endpoint.getSecurityGroupIds(), addSecurityGroupIds, removeSecurityGroupIds);
+
+        if (Boolean.TRUE.equals(resetPolicy)) {
+            endpoint.setPolicyDocument(null);
+        } else if (policyDocument != null) {
+            endpoint.setPolicyDocument(policyDocument);
+        }
+        if (privateDnsEnabled != null) {
+            endpoint.setPrivateDnsEnabled(privateDnsEnabled);
+        }
+
+        vpcEndpoints.put(key(region, endpointId), endpoint);
+        return endpoint;
+    }
+
+    /** Removals apply before additions, and an id is never added twice. */
+    private static void applyIdChanges(List<String> current, List<String> toAdd, List<String> toRemove) {
+        current.removeAll(toRemove);
+        for (String id : toAdd) {
+            if (!current.contains(id)) {
+                current.add(id);
+            }
+        }
     }
 
     public List<VpcEndpoint> describeVpcEndpoints(String region, List<String> endpointIds,
@@ -2781,6 +2879,7 @@ public class Ec2Service implements ContainerTeardown {
                 .filter(endpoint -> matchesFilters(endpoint, filters, region))
                 .collect(Collectors.toList());
     }
+
 
     public List<VpcEndpoint> deleteVpcEndpoints(String region, List<String> endpointIds) {
         ensureDefaultResources(region);
@@ -2982,6 +3081,17 @@ public class Ec2Service implements ContainerTeardown {
                 .filter(sg -> sg.getRegion().equals(region))
                 .filter(sg -> groupIds.isEmpty() || groupIds.contains(sg.getGroupId()))
                 .filter(sg -> groupNames.isEmpty() || groupNames.contains(sg.getGroupName()))
+                .filter(sg -> matchesFilters(sg, filters, region))
+                .collect(Collectors.toList());
+    }
+
+    public List<SecurityGroup> getSecurityGroupsForVpc(String region, String vpcId,
+                                                        Map<String, List<String>> filters) {
+        ensureDefaultResources(region);
+        getRequiredVpc(region, vpcId);
+        return securityGroups.scan(k -> true).stream()
+                .filter(sg -> sg.getRegion().equals(region))
+                .filter(sg -> vpcId.equals(sg.getVpcId()))
                 .filter(sg -> matchesFilters(sg, filters, region))
                 .collect(Collectors.toList());
     }
@@ -4584,6 +4694,18 @@ public class Ec2Service implements ContainerTeardown {
         synchronized (lockFor(key(region, routeTableId))) {
             RouteTable current = getRequiredRouteTable(region, routeTableId);
             List<Route> next = new ArrayList<>(current.getRoutes());
+            // A destination identifies a route: ReplaceRoute matches the first copy and DeleteRoute
+            // removes every copy, so a table holding two routes with the same destination has no
+            // well-defined behaviour for either. AWS rejects the second CreateRoute instead, and it
+            // makes no exception for the local route seeded by CreateRouteTable.
+            if (next.stream().anyMatch(r -> matchesDestination(r, destinationCidrBlock,
+                    destinationIpv6CidrBlock, destinationPrefixListId))) {
+                throw new AwsException("RouteAlreadyExists",
+                        "The route identified by "
+                                + destinationLabel(destinationCidrBlock, destinationIpv6CidrBlock,
+                                        destinationPrefixListId)
+                                + " already exists", 400);
+            }
             Route route = new Route(destinationCidrBlock, gatewayId, "CreateRoute");
             route.setDestinationIpv6CidrBlock(destinationIpv6CidrBlock);
             route.setDestinationPrefixListId(destinationPrefixListId);
@@ -5007,6 +5129,8 @@ public class Ec2Service implements ContainerTeardown {
                 case "instance-type" -> matchesValue(values, inst.getInstanceType());
                 case "vpc-id" -> matchesValue(values, inst.getVpcId());
                 case "subnet-id" -> matchesValue(values, inst.getSubnetId());
+                case "availabilityZone", "availability-zone" -> inst.getPlacement() != null
+                        && matchesValue(values, inst.getPlacement().getAvailabilityZone());
                 default -> true;
             };
         }
@@ -5526,5 +5650,81 @@ public class Ec2Service implements ContainerTeardown {
         }
 
         return result;
+    }
+
+    // ─── Resource Explorer 2 ───────────────────────────────────────────────────
+
+    /**
+     * The EC2 resources Resource Explorer indexes. Each store is scanned across every Region,
+     * because a provider answers for the whole emulator rather than for the request's Region.
+     *
+     * <p>Types not listed here — images, snapshots, key pairs, transit gateways — are omitted
+     * deliberately: they are either AWS-owned catalogue entries rather than account resources, or
+     * carry no tags and no identity worth searching on.
+     */
+    @Override
+    public List<ExplorerResource> getResources() {
+        List<ExplorerResource> resources = new ArrayList<>();
+        collectExplorerResources(resources, instances.scan(k -> true), "instance",
+                Instance::getInstanceId, Instance::getRegion, Instance::getLaunchTime, Instance::getTags);
+        collectExplorerResources(resources, vpcs.scan(k -> true), "vpc",
+                Vpc::getVpcId, Vpc::getRegion, v -> null, Vpc::getTags);
+        collectExplorerResources(resources, subnets.scan(k -> true), "subnet",
+                Subnet::getSubnetId, Subnet::getRegion, s -> null, Subnet::getTags);
+        collectExplorerResources(resources, securityGroups.scan(k -> true), "security-group",
+                SecurityGroup::getGroupId, SecurityGroup::getRegion, g -> null, SecurityGroup::getTags);
+        collectExplorerResources(resources, volumes.scan(k -> true), "volume",
+                Volume::getVolumeId, Volume::getRegion, Volume::getCreateTime, Volume::getTags);
+        collectExplorerResources(resources, internetGateways.scan(k -> true), "internet-gateway",
+                InternetGateway::getInternetGatewayId, InternetGateway::getRegion, g -> null, InternetGateway::getTags);
+        collectExplorerResources(resources, natGateways.scan(k -> true), "natgateway",
+                NatGateway::getNatGatewayId, NatGateway::getRegion, NatGateway::getCreateTime, NatGateway::getTags);
+        collectExplorerResources(resources, routeTables.scan(k -> true), "route-table",
+                RouteTable::getRouteTableId, RouteTable::getRegion, t -> null, RouteTable::getTags);
+        return resources;
+    }
+
+    @Override
+    public Set<SupportedResourceType> getSupportedResourceTypes() {
+        return Set.of(
+                new SupportedResourceType("ec2:instance", "ec2", true),
+                new SupportedResourceType("ec2:vpc", "ec2", true),
+                new SupportedResourceType("ec2:subnet", "ec2", true),
+                new SupportedResourceType("ec2:security-group", "ec2", true),
+                new SupportedResourceType("ec2:volume", "ec2", true),
+                new SupportedResourceType("ec2:internet-gateway", "ec2", true),
+                new SupportedResourceType("ec2:natgateway", "ec2", true),
+                new SupportedResourceType("ec2:route-table", "ec2", true));
+    }
+
+    private <T> void collectExplorerResources(List<ExplorerResource> out, List<T> stored, String resourceType,
+                                              Function<T, String> id, Function<T, String> region,
+                                              Function<T, Instant> createdAt, Function<T, List<Tag>> tags) {
+        for (T resource : stored) {
+            String resourceId = id.apply(resource);
+            String resourceRegion = region.apply(resource);
+            if (resourceId == null || resourceRegion == null) {
+                continue;
+            }
+            Instant created = createdAt.apply(resource);
+            out.add(new ExplorerResource(
+                    "arn:aws:ec2:" + resourceRegion + ":" + accountId + ":" + resourceType + "/" + resourceId,
+                    "ec2:" + resourceType, "ec2", resourceRegion, accountId,
+                    created != null ? created : Instant.now(),
+                    explorerTags(tags.apply(resource))));
+        }
+    }
+
+    private static Map<String, String> explorerTags(List<Tag> tags) {
+        if (tags == null) {
+            return Map.of();
+        }
+        Map<String, String> converted = new LinkedHashMap<>();
+        for (Tag tag : tags) {
+            if (tag.getKey() != null) {
+                converted.put(tag.getKey(), tag.getValue() != null ? tag.getValue() : "");
+            }
+        }
+        return converted;
     }
 }

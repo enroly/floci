@@ -131,7 +131,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 : requestContext.getAccountId();
         String resource = arnBuilder.build(credentialScope, ctx, region, accountId);
 
-        Map<String, String> conditionContext = conditionContextResolver.resolve(credentialScope, action, ctx);
+        Map<String, String> conditionContext =
+                conditionContextResolver.resolve(credentialScope, action, ctx, resource, region, accountId);
         Decision decision = evaluator.evaluate(caller, null, action, resource, conditionContext);
         if (decision == Decision.DENY) {
             LOG.infov("IAM enforcement DENY: akid={0} action={1} resource={2}", akid, action, resource);

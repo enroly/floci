@@ -2863,6 +2863,12 @@ public class CloudFormationResourceProvisioner {
 
     // ── IAM Policy ────────────────────────────────────────────────────────────
 
+    private static String resolvePolicyDocument(JsonNode props, CloudFormationTemplateEngine engine) {
+        JsonNode documentNode = props != null ? props.get("PolicyDocument") : null;
+        String resolved = documentNode != null ? engine.resolveJsonAttributeStrict(documentNode) : null;
+        return resolved != null ? resolved : "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+    }
+
     /**
      * Provisions {@code AWS::IAM::Policy}, which in AWS is an <em>inline</em> policy embedded in the
      * named roles/users/groups (equivalent to PutRolePolicy/PutUserPolicy/PutGroupPolicy) — <em>not</em>
@@ -2885,9 +2891,7 @@ public class CloudFormationResourceProvisioner {
                     ? previousPolicyName
                     : generatePhysicalName(stackName, r.getLogicalId(), 128, false);
         }
-        String document = props != null && props.has("PolicyDocument")
-                ? props.get("PolicyDocument").toString()
-                : "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+        String document = resolvePolicyDocument(props, engine);
 
         final String name = policyName;
         final String doc = document;
@@ -3044,9 +3048,7 @@ public class CloudFormationResourceProvisioner {
         if (policyName == null || policyName.isBlank()) {
             policyName = generatePhysicalName(stackName, r.getLogicalId(), 128, false);
         }
-        String document = props != null && props.has("PolicyDocument")
-                ? props.get("PolicyDocument").toString()
-                : "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+        String document = resolvePolicyDocument(props, engine);
         List<String> roleNames = resolveStringList(props, "Roles", engine);
 
         var policy = iamService.createPolicy(policyName, "/", null, document, Map.of());
@@ -3173,7 +3175,7 @@ public class CloudFormationResourceProvisioner {
         String targetId = requireSecretTargetProperty(props, "TargetId", engine);
         String targetType = requireSecretTargetProperty(props, "TargetType", engine);
         validateSecretTargetType(targetType);
-        SecretTargetConnection connection = resolveSecretTargetConnection(targetType, targetId);
+        SecretTargetConnection connection = resolveSecretTargetConnection(targetType, targetId, region);
 
         String previousSecretId = r.getPhysicalId();
         String previousManagedKeys = r.getAttributes().get(SECRET_TARGET_MANAGED_KEYS_ATTR);
@@ -3311,18 +3313,18 @@ public class CloudFormationResourceProvisioner {
                 "SecretString for AWS::SecretsManager::SecretTargetAttachment must be a JSON object.", 400);
     }
 
-    private SecretTargetConnection resolveSecretTargetConnection(String targetType, String targetId) {
+    private SecretTargetConnection resolveSecretTargetConnection(String targetType, String targetId, String region) {
         return switch (targetType) {
-            case "AWS::RDS::DBInstance" -> dbInstanceConnection(targetId);
-            case "AWS::RDS::DBCluster" -> dbClusterConnection(targetId);
-            case "AWS::DocDB::DBInstance" -> docDbInstanceConnection(targetId);
-            case "AWS::DocDB::DBCluster" -> docDbClusterConnection(targetId);
+            case "AWS::RDS::DBInstance" -> dbInstanceConnection(targetId, region);
+            case "AWS::RDS::DBCluster" -> dbClusterConnection(targetId, region);
+            case "AWS::DocDB::DBInstance" -> docDbInstanceConnection(targetId, region);
+            case "AWS::DocDB::DBCluster" -> docDbClusterConnection(targetId, region);
             default -> throw new IllegalStateException("Validated target type was not handled: " + targetType);
         };
     }
 
-    private SecretTargetConnection dbInstanceConnection(String targetId) {
-        var instance = rdsService.getDbInstance(targetId);
+    private SecretTargetConnection dbInstanceConnection(String targetId, String region) {
+        var instance = rdsService.getDbInstance(targetId, region);
         if (instance == null || instance.getEngine() == null || instance.getEndpoint() == null
                 || instance.getEndpoint().address() == null
                 || instance.getEndpoint().address().isBlank()
@@ -3340,8 +3342,8 @@ public class CloudFormationResourceProvisioner {
                 instance.getDbInstanceIdentifier());
     }
 
-    private SecretTargetConnection dbClusterConnection(String targetId) {
-        var cluster = rdsService.getDbCluster(targetId);
+    private SecretTargetConnection dbClusterConnection(String targetId, String region) {
+        var cluster = rdsService.getDbCluster(targetId, region);
         if (cluster == null || cluster.getEngine() == null || cluster.getEndpoint() == null
                 || cluster.getEndpoint().address() == null
                 || cluster.getEndpoint().address().isBlank()
@@ -3359,8 +3361,8 @@ public class CloudFormationResourceProvisioner {
                 cluster.getDbClusterIdentifier());
     }
 
-    private SecretTargetConnection docDbInstanceConnection(String targetId) {
-        var instance = docDbService.getDbInstance(targetId);
+    private SecretTargetConnection docDbInstanceConnection(String targetId, String region) {
+        var instance = docDbService.getDbInstance(targetId, region);
         if (instance == null || instance.getEndpoint() == null
                 || instance.getEndpoint().isBlank()
                 || instance.getPort() <= 0
@@ -3377,8 +3379,8 @@ public class CloudFormationResourceProvisioner {
                 instance.getDbInstanceIdentifier());
     }
 
-    private SecretTargetConnection docDbClusterConnection(String targetId) {
-        var cluster = docDbService.getDbCluster(targetId);
+    private SecretTargetConnection docDbClusterConnection(String targetId, String region) {
+        var cluster = docDbService.getDbCluster(targetId, region);
         if (cluster == null || cluster.getEndpoint() == null
                 || cluster.getEndpoint().isBlank()
                 || cluster.getPort() <= 0

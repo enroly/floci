@@ -38,12 +38,19 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * CloudFormation stack lifecycle management — Create, Update, Delete stacks via ChangeSets.
  */
 @ApplicationScoped
-public class CloudFormationService {
+public class CloudFormationService implements ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(CloudFormationService.class);
 
@@ -1685,6 +1692,25 @@ public class CloudFormationService {
                 && normalizedHost.endsWith("." + normalizedSuffix);
     }
 
+    /**
+     * Terminal statuses under which {@link #executeTemplate} actually finished creating or
+     * updating a stack's resources and computed its Outputs, including the two "committed but
+     * still tidying up" statuses, which still mean Outputs were resolved successfully.
+     *
+     * <p>Every other terminal status ({@code ROLLBACK_COMPLETE}, {@code ROLLBACK_FAILED},
+     * {@code UPDATE_ROLLBACK_COMPLETE}, {@code UPDATE_ROLLBACK_FAILED}, {@code CREATE_FAILED},
+     * {@code UPDATE_FAILED}) means the resource loop failed and rolled back before Outputs were
+     * ever computed: see {@link #executeTemplate}, which only reaches its Outputs block once the
+     * whole resource loop has succeeded. This is deliberately an allow-list rather than a
+     * deny-list of failure strings: a nested stack's own {@code rollbackFailedExecution} rewrites
+     * its status past {@code CREATE_FAILED}/{@code UPDATE_FAILED} into one of the ROLLBACK_*
+     * statuses before this method ever inspects it, so checking for the FAILED strings here can
+     * never match on a create and silently reports a stack that rolled back to nothing as
+     * CREATE_COMPLETE.
+     */
+    private static final Set<String> NESTED_STACK_SUCCESS_STATUSES = Set.of(
+            "CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS");
+
     private StackResource executeNestedStack(Stack parentStack, String logicalId, JsonNode props,
                                              CloudFormationTemplateEngine engine, String region,
                                              String accountId, boolean isCreate) {
@@ -1718,11 +1744,11 @@ public class CloudFormationService {
         resource.getAttributes().put("Arn", childStack.getStackId());
         childStack.getOutputs().forEach((k, v) -> resource.getAttributes().put("Outputs." + k, v));
 
-        if ("CREATE_FAILED".equals(childStack.getStatus()) || "UPDATE_FAILED".equals(childStack.getStatus())) {
+        if (NESTED_STACK_SUCCESS_STATUSES.contains(childStack.getStatus())) {
+            resource.setStatus("CREATE_COMPLETE");
+        } else {
             resource.setStatus("CREATE_FAILED");
             resource.setStatusReason("Nested stack " + childStackName + " failed: " + childStack.getStatusReason());
-        } else {
-            resource.setStatus("CREATE_COMPLETE");
         }
 
         return resource;
@@ -2062,5 +2088,30 @@ public class CloudFormationService {
 
     private static String key(String stackName, String region) {
         return region + ":" + stackName;
+    }
+
+    // ─── Resource Explorer 2 ───────────────────────────────────────────────────
+
+    @Override
+    public List<ExplorerResource> getResources() {
+        List<ExplorerResource> resources = new ArrayList<>();
+        for (Stack stack : stacks.values()) {
+            String arn = stack.getStackId();
+            if (arn == null) {
+                continue;
+            }
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            resources.add(new ExplorerResource(
+                    arn, "cloudformation:stack", "cloudformation",
+                    parsed.region(), parsed.accountId(),
+                    stack.getCreationTime() != null ? stack.getCreationTime() : Instant.now(),
+                    stack.getTags() != null ? stack.getTags() : Map.of()));
+        }
+        return resources;
+    }
+
+    @Override
+    public Set<SupportedResourceType> getSupportedResourceTypes() {
+        return Set.of(new SupportedResourceType("cloudformation:stack", "cloudformation", true));
     }
 }

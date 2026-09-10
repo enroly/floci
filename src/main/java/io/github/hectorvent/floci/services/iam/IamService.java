@@ -5,11 +5,15 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.SessionAccountLookup;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.iam.model.AccessKey;
+import io.github.hectorvent.floci.services.iam.model.AccountPasswordPolicy;
 import io.github.hectorvent.floci.services.iam.model.IamGroup;
 import io.github.hectorvent.floci.services.iam.model.IamPolicy;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
@@ -28,6 +32,7 @@ import org.jboss.logging.Logger;
 
 import java.time.Instant;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -48,7 +53,7 @@ import java.util.regex.Pattern;
  */
 @Startup
 @ApplicationScoped
-public class IamService implements SessionAccountLookup {
+public class IamService implements SessionAccountLookup, ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(IamService.class);
     private static final String CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -63,6 +68,14 @@ public class IamService implements SessionAccountLookup {
     private static final int MAX_OIDC_CLIENT_IDS = 100;
     private static final int MAX_OIDC_THUMBPRINTS = 5;
     private static final int MAX_OIDC_URL_LENGTH = 255;
+    private static final String ACCOUNT_PASSWORD_POLICY_KEY = "account-password-policy";
+    /** AWS-documented bounds for the account password policy's numeric fields. */
+    private static final int MIN_PASSWORD_LENGTH_FLOOR = 6;
+    private static final int MIN_PASSWORD_LENGTH_CEILING = 128;
+    private static final int MAX_PASSWORD_AGE_FLOOR = 1;
+    private static final int MAX_PASSWORD_AGE_CEILING = 1095;
+    private static final int PASSWORD_REUSE_PREVENTION_FLOOR = 1;
+    private static final int PASSWORD_REUSE_PREVENTION_CEILING = 24;
 
     /** Guards the read-modify-write in the OIDC provider mutators. */
     private final Object oidcProviderLock = new Object();
@@ -95,6 +108,11 @@ public class IamService implements SessionAccountLookup {
      * silently keeping only one. A single lock across accounts is enough: alias writes are rare.
      */
     private final Object accountAliasLock = new Object();
+    /**
+     * Holds at most one entry per account under {@link #ACCOUNT_PASSWORD_POLICY_KEY} — same
+     * single-value-per-account shape as {@link #accountAliases}.
+     */
+    private final StorageBackend<String, AccountPasswordPolicy> passwordPolicies;
     private final StorageBackend<String, OpenIDConnectProvider> oidcProviders;
     /** Deletion is synchronous, so an issued task id is a completed one; the value is its role. */
     private final StorageBackend<String, String> serviceLinkedRoleDeletions;
@@ -120,6 +138,7 @@ public class IamService implements SessionAccountLookup {
             storageFactory.create("iam", "iam-instance-profiles.json", new TypeReference<>() {}),
             storageFactory.create("iam", "iam-sessions.json", new TypeReference<>() {}),
             storageFactory.create("iam", "iam-account-aliases.json", new TypeReference<>() {}),
+            storageFactory.create("iam", "iam-password-policy.json", new TypeReference<>() {}),
             storageFactory.create("iam", "iam-oidc-providers.json", new TypeReference<>() {}),
             storageFactory.create("iam", "iam-slr-deletions.json", new TypeReference<>() {}),
             regionResolver,
@@ -149,7 +168,7 @@ public class IamService implements SessionAccountLookup {
                RegionResolver regionResolver,
                boolean seedDeployerPrincipal) {
         this(users, groups, roles, policies, accessKeys, instanceProfiles, sessions,
-                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
                 regionResolver, seedDeployerPrincipal, null);
     }
 
@@ -161,6 +180,7 @@ public class IamService implements SessionAccountLookup {
                StorageBackend<String, InstanceProfile> instanceProfiles,
                StorageBackend<String, SessionCredential> sessions,
                StorageBackend<String, String> accountAliases,
+               StorageBackend<String, AccountPasswordPolicy> passwordPolicies,
                StorageBackend<String, OpenIDConnectProvider> oidcProviders,
                StorageBackend<String, String> serviceLinkedRoleDeletions,
                RegionResolver regionResolver,
@@ -174,6 +194,7 @@ public class IamService implements SessionAccountLookup {
         this.instanceProfiles = instanceProfiles;
         this.sessions = sessions;
         this.accountAliases = accountAliases;
+        this.passwordPolicies = passwordPolicies;
         this.oidcProviders = oidcProviders;
         this.serviceLinkedRoleDeletions = serviceLinkedRoleDeletions;
         this.regionResolver = regionResolver;
@@ -195,7 +216,7 @@ public class IamService implements SessionAccountLookup {
         for (AwsManagedPolicies.ManagedPolicyDef def : AwsManagedPolicies.POLICIES) {
             String arn = def.arn();
             catalog.put(arn, new IamPolicy("ANPA" + randomId(16), def.name(), def.path(), arn,
-                    def.description(), AwsManagedPolicies.PERMISSIVE_DOCUMENT));
+                    def.description(), def.resolvedDocument()));
         }
         return catalog;
     }
@@ -789,9 +810,9 @@ public class IamService implements SessionAccountLookup {
      * keys; quota values are cross-checked against AWS's published IAM service quotas
      * (docs.aws.amazon.com/general/latest/gr/iam-service.html), though floci itself enforces
      * only the 5-versions-per-policy cap in {@link #createPolicyVersion}. Resources floci does
-     * not track at all (MFA devices, SAML/OIDC providers, server certificates, account password -
-     * all stub-empty elsewhere in this handler) are reported as zero rather than omitted, so
-     * callers indexing into the full AWS field set don't hit a missing-key error.
+     * not track at all (MFA devices, SAML providers, server certificates, account password - all
+     * stub-empty elsewhere in this handler) are reported as zero rather than omitted, so callers
+     * indexing into the full AWS field set don't hit a missing-key error.
      */
     public Map<String, Long> getAccountSummary() {
         long localPolicyCount = 0;
@@ -823,7 +844,7 @@ public class IamService implements SessionAccountLookup {
         summary.put("InstanceProfilesQuota", 1000L);
         summary.put("AttachedPoliciesPerUserQuota", 10L);
         summary.put("AttachedPoliciesPerGroupQuota", 10L);
-        summary.put("AttachedPoliciesPerRoleQuota", 10L);
+        summary.put("AttachedPoliciesPerRoleQuota", 20L);
         summary.put("GroupPolicySizeQuota", 5120L);
         summary.put("UserPolicySizeQuota", 2048L);
         summary.put("RolePolicySizeQuota", 10240L);
@@ -831,10 +852,12 @@ public class IamService implements SessionAccountLookup {
         summary.put("SigningCertificatesPerUserQuota", 2L);
         summary.put("ServerCertificates", 0L);
         summary.put("ServerCertificatesQuota", 20L);
-        summary.put("Providers", 0L);
+        summary.put("Providers", (long) oidcProviders.scan(k -> true).size());
         summary.put("MFADevices", 0L);
         summary.put("MFADevicesInUse", 0L);
         summary.put("AccountMFAEnabled", 0L);
+        // AWS reports whether the root account has access keys, not whether IAM users do.
+        // Floci does not model root access keys, so this remains false even when user keys exist.
         summary.put("AccountAccessKeysPresent", 0L);
         summary.put("AccountSigningCertificatesPresent", 0L);
         summary.put("AccountPasswordPresent", 0L);
@@ -1269,6 +1292,43 @@ public class IamService implements SessionAccountLookup {
                 .toList();
     }
 
+    @Override
+    public List<ExplorerResource> getResources() {
+        List<ExplorerResource> resources = new ArrayList<>();
+        for (IamUser user : users.scan(k -> true)) {
+            addIamResource(resources, user.getArn(), "iam:user", user.getCreateDate(), user.getTags());
+        }
+        for (IamRole role : roles.scan(k -> true)) {
+            addIamResource(resources, role.getArn(), "iam:role", role.getCreateDate(), role.getTags());
+        }
+        return resources;
+    }
+
+    private void addIamResource(List<ExplorerResource> out, String arn, String type,
+                                Instant createDate, Map<String, String> tags) {
+        if (arn == null) {
+            return;
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        // IAM is a global service: its ARNs carry no region. Resource Explorer reports
+        // global resources with the region "global" (not an empty string).
+        String region = parsed.region() == null || parsed.region().isEmpty()
+                ? "global"
+                : parsed.region();
+        out.add(new ExplorerResource(
+                arn, type, "iam",
+                region, parsed.accountId(),
+                createDate != null ? createDate : Instant.now(),
+                tags != null ? tags : Map.of()));
+    }
+
+    @Override
+    public Set<SupportedResourceType> getSupportedResourceTypes() {
+        return Set.of(
+                new SupportedResourceType("iam:user", "iam", true),
+                new SupportedResourceType("iam:role", "iam", true));
+    }
+
     // =========================================================================
     // Account Aliases
     // ==================================================================
@@ -1323,6 +1383,63 @@ public class IamService implements SessionAccountLookup {
                     "The specified value for accountAlias is invalid. It must be a minimum length of 3 "
                             + "characters and maximum length of 63 characters, contain only digits, lowercase "
                             + "letters, and hyphens (-), but cannot begin or end with a hyphen.", 400);
+        }
+    }
+
+    // =========================================================================
+    // Account Password Policy
+    // =========================================================================
+
+    public Optional<AccountPasswordPolicy> getAccountPasswordPolicy() {
+        return passwordPolicies.get(ACCOUNT_PASSWORD_POLICY_KEY);
+    }
+
+    /**
+     * Unlike the account alias, an account password policy is set wholesale — every call replaces
+     * the stored policy rather than merging into it, matching AWS: fields the caller omits reset to
+     * their documented defaults instead of carrying over the previous policy's value.
+     */
+    public AccountPasswordPolicy updateAccountPasswordPolicy(AccountPasswordPolicy policy) {
+        validateAccountPasswordPolicy(policy);
+        passwordPolicies.put(ACCOUNT_PASSWORD_POLICY_KEY, policy);
+        LOG.infov("Updated IAM account password policy");
+        return policy;
+    }
+
+    /**
+     * AWS raises NoSuchEntity when no custom policy has ever been set, rather than treating the
+     * delete as a no-op — DeleteAccountAlias's mismatch case is the same shape of "there is nothing
+     * here to remove."
+     */
+    public void deleteAccountPasswordPolicy() {
+        if (passwordPolicies.get(ACCOUNT_PASSWORD_POLICY_KEY).isEmpty()) {
+            throw new AwsException("NoSuchEntity",
+                    "The account policy with name PasswordPolicy cannot be found.", 404);
+        }
+        passwordPolicies.delete(ACCOUNT_PASSWORD_POLICY_KEY);
+        LOG.infov("Deleted IAM account password policy");
+    }
+
+    private void validateAccountPasswordPolicy(AccountPasswordPolicy policy) {
+        int minLength = policy.getMinimumPasswordLength();
+        if (minLength < MIN_PASSWORD_LENGTH_FLOOR || minLength > MIN_PASSWORD_LENGTH_CEILING) {
+            throw new AwsException("ValidationError",
+                    "MinimumPasswordLength must be between " + MIN_PASSWORD_LENGTH_FLOOR + " and "
+                            + MIN_PASSWORD_LENGTH_CEILING + ".", 400);
+        }
+        Integer maxAge = policy.getMaxPasswordAge();
+        if (maxAge != null && (maxAge < MAX_PASSWORD_AGE_FLOOR || maxAge > MAX_PASSWORD_AGE_CEILING)) {
+            throw new AwsException("ValidationError",
+                    "MaxPasswordAge must be between " + MAX_PASSWORD_AGE_FLOOR + " and "
+                            + MAX_PASSWORD_AGE_CEILING + ".", 400);
+        }
+        Integer reusePrevention = policy.getPasswordReusePrevention();
+        if (reusePrevention != null
+                && (reusePrevention < PASSWORD_REUSE_PREVENTION_FLOOR
+                        || reusePrevention > PASSWORD_REUSE_PREVENTION_CEILING)) {
+            throw new AwsException("ValidationError",
+                    "PasswordReusePrevention must be between " + PASSWORD_REUSE_PREVENTION_FLOOR + " and "
+                            + PASSWORD_REUSE_PREVENTION_CEILING + ".", 400);
         }
     }
 

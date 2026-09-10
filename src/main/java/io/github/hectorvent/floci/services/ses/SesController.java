@@ -123,6 +123,9 @@ public class SesController {
             // without leaving a half-created identity behind, matching AWS and the ConfigurationSetName
             // pre-check below.
             List<Tag> parsedTags = parseTagsArray(request.path("Tags"));
+            // Validate tags before creating the identity so an invalid set fails atomically
+            // instead of leaving the identity behind.
+            SesTags.validate(parsedTags);
 
             // Verified against AWS: a non-existent ConfigurationSetName fails the whole call
             // (NotFoundException) without creating the identity, so validate it before creating.
@@ -719,7 +722,11 @@ public class SesController {
     public Response createCustomVerificationEmailTemplate(@Context HttpHeaders headers, String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            CustomVerificationEmailTemplate t = parseCvet(objectMapper.readTree(body));
+            JsonNode request = objectMapper.readTree(body);
+            CustomVerificationEmailTemplate t = parseCvet(request);
+            // Tags exist only on the create request; UpdateCustomVerificationEmailTemplate has no
+            // Tags member and preserves the stored ones.
+            t.setTags(parseTagsArray(request.path("Tags")));
             sesService.createCustomVerificationEmailTemplate(t, region);
             return Response.ok(objectMapper.createObjectNode()).build();
         } catch (AwsException e) {
@@ -1465,7 +1472,8 @@ public class SesController {
             } else {
                 scalingMode = scalingNode.asText();
             }
-            sesService.createDedicatedIpPool(poolName, scalingMode, region);
+            List<Tag> tags = parseTagsArray(request.path("Tags"));
+            sesService.createDedicatedIpPool(poolName, scalingMode, tags, region);
             LOG.infov("SES V2 CreateDedicatedIpPool: {0}", poolName);
             return Response.ok(objectMapper.createObjectNode()).build();
         } catch (AwsException e) {
@@ -1492,7 +1500,11 @@ public class SesController {
         String region = regionResolver.resolveRegion(headers);
         DedicatedIpPool pool = sesService.getDedicatedIpPool(poolName, region);
         ObjectNode result = objectMapper.createObjectNode();
-        result.set("DedicatedIpPool", objectMapper.valueToTree(pool));
+        // Built explicitly: the AWS DedicatedIpPool shape carries only PoolName and ScalingMode;
+        // the model's tags are exposed via ListTagsForResource, not here.
+        ObjectNode poolNode = result.putObject("DedicatedIpPool");
+        poolNode.put("PoolName", pool.getPoolName());
+        poolNode.put("ScalingMode", pool.getScalingMode());
         return Response.ok(result).build();
     }
 
@@ -2450,11 +2462,28 @@ public class SesController {
         }
         List<Tag> out = new ArrayList<>();
         for (JsonNode t : tagsNode) {
-            out.add(new Tag(
-                    t.path("Key").asText(null),
-                    t.path("Value").asText(null)));
+            // Each element must be a JSON object. A scalar/array/null element is a wire deserialization
+            // error (AWS returns SerializationException for a scalar/array element; it returns a 500
+            // InternalFailure for a null element, a server-side bug we normalize to the same 400).
+            if (!t.isObject()) {
+                throw new AwsException("SerializationException", null, 400);
+            }
+            JsonNode key = t.path("Key");
+            JsonNode value = t.path("Value");
+            // A present-but-non-string Key/Value (number, boolean, object, array) is a wire
+            // deserialization error, not a coercible value: AWS restJson1 rejects it with
+            // SerializationException rather than turning 123 into "123". A missing/null member is left
+            // to the downstream service validation, matching AWS.
+            if (nonStringMember(key) || nonStringMember(value)) {
+                throw new AwsException("SerializationException", null, 400);
+            }
+            out.add(new Tag(key.asText(null), value.asText(null)));
         }
         return out;
+    }
+
+    private static boolean nonStringMember(JsonNode node) {
+        return !node.isMissingNode() && !node.isNull() && !node.isTextual();
     }
 
     /**

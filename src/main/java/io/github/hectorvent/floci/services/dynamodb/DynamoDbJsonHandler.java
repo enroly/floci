@@ -718,29 +718,65 @@ public class DynamoDbJsonHandler {
         return changedAttributes;
     }
 
-    // DynamoDB rejects an ExclusiveStartKey whose attribute set does not exactly match the
-    // key schema being paged: the table's primary key, plus the index's key attributes when
-    // an IndexName is supplied. Query and Scan report different messages for the same fault.
+    // DynamoDB requires an ExclusiveStartKey to exactly match the paged key schema's
+    // attribute names and scalar types. Query and Scan report different messages for faults.
     private void validateExclusiveStartKey(JsonNode exclusiveStartKey, TableDefinition table,
-                                           String indexName, boolean isScan) {
+                                           DynamoDbAccessPath accessPath, boolean isScan) {
         if (exclusiveStartKey == null || exclusiveStartKey.isNull()) return;
         Set<String> expected = new HashSet<>();
         expected.add(table.getPartitionKeyName());
         String sortKey = table.getSortKeyName();
         if (sortKey != null) expected.add(sortKey);
-        if (indexName != null) {
-            table.findGsi(indexName).ifPresent(g ->
-                    g.getKeySchema().forEach(k -> expected.add(k.getAttributeName())));
-            table.findLsi(indexName).ifPresent(l ->
-                    l.getKeySchema().forEach(k -> expected.add(k.getAttributeName())));
+        if (accessPath.isIndex()) {
+            expected.addAll(accessPath.keyAttributeNames());
         }
         Set<String> actual = new HashSet<>();
         exclusiveStartKey.fieldNames().forEachRemaining(actual::add);
-        if (!actual.equals(expected)) {
-            throw new AwsException("ValidationException", isScan
-                    ? "The provided starting key is invalid: The provided key element does not match the schema"
-                    : "The provided starting key is invalid", 400);
+        if (!actual.equals(expected) || hasInvalidKeyValue(exclusiveStartKey, table, expected)) {
+            throw invalidStartingKey(isScan);
         }
+    }
+
+    private boolean hasInvalidKeyValue(JsonNode exclusiveStartKey, TableDefinition table,
+                                       Set<String> expected) {
+        if (table.getAttributeDefinitions() == null) {
+            return true;
+        }
+        for (String attribute : expected) {
+            String expectedType = table.getAttributeDefinitions().stream()
+                    .filter(definition -> attribute.equals(definition.getAttributeName()))
+                    .map(AttributeDefinition::getAttributeType)
+                    .findFirst()
+                    .orElse(null);
+            if (expectedType == null || hasInvalidScalarValue(exclusiveStartKey.get(attribute), expectedType)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasInvalidScalarValue(JsonNode value, String expectedType) {
+        if (value == null || !value.isObject() || value.size() != 1 || !value.has(expectedType)) {
+            return true;
+        }
+        JsonNode payload = value.get(expectedType);
+        if (payload == null || !payload.isTextual() || payload.textValue().isEmpty()) {
+            return true;
+        }
+        if ("N".equals(expectedType)) {
+            DynamoDbNumberUtils.validateAndNormalize(payload.textValue());
+        }
+        if ("B".equals(expectedType)) {
+            return !payload.textValue().matches(
+                    "(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?");
+        }
+        return false;
+    }
+
+    private AwsException invalidStartingKey(boolean isScan) {
+        return new AwsException("ValidationException", isScan
+                ? "The provided starting key is invalid: The provided key element does not match the schema"
+                : "The provided starting key is invalid", 400);
     }
 
     private static final Set<String> VALID_SELECT = Set.of(
@@ -830,8 +866,8 @@ public class DynamoDbJsonHandler {
 
         TableDefinition queryTable = dynamoDbService.describeTable(tableName, region);
         DynamoDbAccessPath queryAccessPath = DynamoDbAccessPath.resolve(queryTable, indexName);
-        DynamoDbAccessPathValidator.validateQuery(queryAccessPath, keyConditions, keyConditionExpr,
-                filterExpr, queryFilter, exprAttrNames);
+        DynamoDbAccessPathValidator.validateQuery(queryTable, queryAccessPath, keyConditions,
+                keyConditionExpr, filterExpr, queryFilter, exprAttrNames, exprAttrValues);
         DynamoDbAccessPathValidator.validateSelection(queryTable, queryAccessPath, select,
                 projectionExpression, attributesToGet, exprAttrNames);
 
@@ -861,7 +897,7 @@ public class DynamoDbJsonHandler {
         }
 
         if (exclusiveStartKey != null) {
-            validateExclusiveStartKey(exclusiveStartKey, queryTable, indexName, false);
+            validateExclusiveStartKey(exclusiveStartKey, queryTable, queryAccessPath, false);
         }
 
         DynamoDbService.QueryResult result = dynamoDbService.query(tableName, keyConditions,
@@ -983,7 +1019,7 @@ public class DynamoDbJsonHandler {
                 projectionExpressionScan, attributesToGetScan, exprAttrNames);
 
         if (exclusiveStartKey != null) {
-            validateExclusiveStartKey(exclusiveStartKey, scanTable, indexNameScan, true);
+            validateExclusiveStartKey(exclusiveStartKey, scanTable, scanAccessPath, true);
         }
 
         DynamoDbService.ScanResult result = dynamoDbService.scan(
@@ -1072,12 +1108,12 @@ public class DynamoDbJsonHandler {
 
         for (Map.Entry<String, List<JsonNode>> entry : items.entrySet()) {
             TableDefinition bwTable = dynamoDbService.describeTable(entry.getKey(), region);
-            Set<String> seen = new HashSet<>();
+            Set<DynamoDbItemKey.LogicalIdentity> seen = new HashSet<>();
             for (JsonNode writeReq : entry.getValue()) {
                 JsonNode keyNode = writeReq.has("PutRequest")
                         ? writeReq.get("PutRequest").get("Item")
                         : writeReq.get("DeleteRequest").get("Key");
-                String key = dynamoDbService.buildItemKey(bwTable, keyNode);
+                DynamoDbItemKey.LogicalIdentity key = dynamoDbService.buildItemIdentity(bwTable, keyNode);
                 if (!seen.add(key)) {
                     throw new AwsException("ValidationException",
                             "Provided list of item keys contains duplicates", 400);
@@ -1122,9 +1158,9 @@ public class DynamoDbJsonHandler {
             TableDefinition bgTable = dynamoDbService.describeTable(entry.getKey(), region);
             JsonNode keys = entry.getValue().get("Keys");
             if (keys == null || !keys.isArray()) continue;
-            Set<String> seen = new HashSet<>();
+            Set<DynamoDbItemKey.LogicalIdentity> seen = new HashSet<>();
             for (JsonNode key : keys) {
-                String itemKey = dynamoDbService.buildItemKey(bgTable, key);
+                DynamoDbItemKey.LogicalIdentity itemKey = dynamoDbService.buildItemIdentity(bgTable, key);
                 if (!seen.add(itemKey)) {
                     throw new AwsException("ValidationException",
                             "Provided list of item keys contains duplicates", 400);
@@ -1428,7 +1464,7 @@ public class DynamoDbJsonHandler {
         }
 
         Map<String, TableDefinition> tableCache = new HashMap<>();
-        Set<String> seen = new HashSet<>();
+        Map<String, Set<DynamoDbItemKey.LogicalIdentity>> seen = new HashMap<>();
         for (JsonNode txItem : transactItemsNode) {
             JsonNode op = txItem.has("Put") ? txItem.get("Put")
                         : txItem.has("Delete") ? txItem.get("Delete")
@@ -1440,8 +1476,8 @@ public class DynamoDbJsonHandler {
                     tn -> dynamoDbService.describeTable(tn, region));
             JsonNode keyNode = op.has("Item") ? op.get("Item") : op.get("Key");
             if (keyNode == null) continue;
-            String key = region + "::" + opTable + "::" + dynamoDbService.buildItemKey(txTable, keyNode);
-            if (!seen.add(key)) {
+            DynamoDbItemKey.LogicalIdentity key = dynamoDbService.buildItemIdentity(txTable, keyNode);
+            if (!seen.computeIfAbsent(opTable, ignored -> new HashSet<>()).add(key)) {
                 throw new AwsException("ValidationException",
                         "Transaction request cannot include multiple operations on one item", 400);
             }
@@ -1499,7 +1535,7 @@ public class DynamoDbJsonHandler {
         }
 
         Map<String, TableDefinition> tableCache = new HashMap<>();
-        Set<String> seenGet = new HashSet<>();
+        Map<String, Set<DynamoDbItemKey.LogicalIdentity>> seenGet = new HashMap<>();
         for (JsonNode txItem : transactItemsNode) {
             JsonNode get = txItem.has("Get") ? txItem.get("Get") : null;
             if (get == null) continue;
@@ -1509,8 +1545,8 @@ public class DynamoDbJsonHandler {
             JsonNode keyNode = get.get("Key");
             if (keyNode == null) continue;
             try {
-                String key = region + "::" + opTable + "::" + dynamoDbService.buildItemKey(txTable, keyNode);
-                if (!seenGet.add(key)) {
+                DynamoDbItemKey.LogicalIdentity key = dynamoDbService.buildItemIdentity(txTable, keyNode);
+                if (!seenGet.computeIfAbsent(opTable, ignored -> new HashSet<>()).add(key)) {
                     throw new AwsException("ValidationException",
                             "Transaction request cannot include multiple operations on one item", 400);
                 }

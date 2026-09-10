@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheCont
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheMemcachedContainerManager;
 import io.github.hectorvent.floci.services.elasticache.proxy.ElastiCacheProxyManager;
 import io.github.hectorvent.floci.services.docdb.container.DocDbContainerManager;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import io.github.hectorvent.floci.services.lambda.DynamoDbStreamsEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.KinesisEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.SqsEventSourcePoller;
@@ -84,6 +85,7 @@ public class EmulatorLifecycle {
     private final SqsEventSourcePoller sqsPoller;
     private final KinesisEventSourcePoller kinesisPoller;
     private final DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller;
+    private final DynamoDbService dynamoDbService;
     private final PipesService pipesService;
     private final Ec2MetadataServer ec2MetadataServer;
     private final EcrRegistryManager ecrRegistryManager;
@@ -115,6 +117,7 @@ public class EmulatorLifecycle {
                              SqsEventSourcePoller sqsPoller,
                              KinesisEventSourcePoller kinesisPoller,
                              DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller,
+                             DynamoDbService dynamoDbService,
                              PipesService pipesService,
                              Ec2MetadataServer ec2MetadataServer,
                              EcrRegistryManager ecrRegistryManager,
@@ -145,6 +148,7 @@ public class EmulatorLifecycle {
         this.sqsPoller = sqsPoller;
         this.kinesisPoller = kinesisPoller;
         this.dynamodbStreamsPoller = dynamodbStreamsPoller;
+        this.dynamoDbService = dynamoDbService;
         this.pipesService = pipesService;
         this.ec2MetadataServer = ec2MetadataServer;
         this.ecrRegistryManager = ecrRegistryManager;
@@ -176,7 +180,11 @@ public class EmulatorLifecycle {
         persistentPathValidator.validateAtBoot();
 
         serviceRegistry.logEnabledServices();
+        DynamoDbService.validateItemKeyDelimiter(config.services().dynamodb().itemKeyDelimiter());
         storageFactory.loadAll();
+        if (config.services().dynamodb().enabled()) {
+            dynamoDbService.loadPersistedItems();
+        }
         int sweptSessions = iamService.sweepOrphanedLambdaExecutionRoleSessions();
         if (sweptSessions > 0) {
             LOG.infov("Removed {0} orphaned Lambda execution-role session(s)", sweptSessions);
