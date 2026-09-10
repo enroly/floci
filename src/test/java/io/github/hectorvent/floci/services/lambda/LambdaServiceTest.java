@@ -78,6 +78,26 @@ class LambdaServiceTest {
     }
 
     @Test
+    void configurationOnlyUpdateDrainsTheLatestExecutionEnvironment() {
+        WarmPool warmPool = mock(WarmPool.class);
+        LambdaService configuredService = new LambdaService(
+                new LambdaFunctionStore(new InMemoryStorage<String, LambdaFunction>()),
+                warmPool, new CodeStore(Path.of("target/test-data/lambda-config-code")),
+                new ZipExtractor(), new RegionResolver(REGION, "000000000000"));
+        LambdaFunction created = configuredService.createFunction(REGION, baseRequest("config-function"));
+        String functionArn = created.getFunctionArn();
+        clearInvocations(warmPool);
+
+        LambdaFunction updated = configuredService.updateFunctionConfiguration(REGION, "config-function",
+                Map.of("Environment", Map.of("Variables", Map.of("LOCAL_ENDPOINT", "http://emulator:4566"))));
+
+        assertEquals(Map.of("LOCAL_ENDPOINT", "http://emulator:4566"), updated.getEnvironment());
+        assertEquals(functionArn, updated.getFunctionArn());
+        verify(warmPool).drainEnvironment(updated);
+        verify(warmPool, never()).drainFunction(anyString());
+    }
+
+    @Test
     void createAndUpdateFunctionFileSystemConfig() {
         Map<String, Object> request = baseRequest("efs-function");
         request.put("VpcConfig", vpcConfig());

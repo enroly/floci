@@ -216,7 +216,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         for (AwsManagedPolicies.ManagedPolicyDef def : AwsManagedPolicies.POLICIES) {
             String arn = def.arn();
             catalog.put(arn, new IamPolicy("ANPA" + randomId(16), def.name(), def.path(), arn,
-                    def.description(), AwsManagedPolicies.PERMISSIVE_DOCUMENT));
+                    def.description(), def.resolvedDocument()));
         }
         return catalog;
     }

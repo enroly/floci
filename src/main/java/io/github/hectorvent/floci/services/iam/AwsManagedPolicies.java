@@ -12,19 +12,6 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * Catalog of AWS managed policies, loaded from {@code iam/managed-policies.yaml}.
- *
- * <p>Floci resolves {@code arn:aws:iam::aws:policy/*} ARNs against this catalog, so an ARN
- * that is absent returns {@code NoSuchEntity} — the same as real AWS. Carrying the full
- * published list is what keeps that faithful in both directions: policies AWS actually
- * publishes attach cleanly, while typos and invented names are still rejected. A curated
- * subset would reject valid configurations; resolving every well-formed ARN would accept
- * invalid ones.
- *
- * <p>Policy documents are not modelled. Floci does not evaluate IAM by default, so every
- * entry shares {@link #PERMISSIVE_DOCUMENT} and only the name, path and description matter.
- */
 final class AwsManagedPolicies {
 
     private static final Logger LOG = Logger.getLogger(AwsManagedPolicies.class);
@@ -37,9 +24,14 @@ final class AwsManagedPolicies {
             "{\"Version\":\"2012-10-17\",\"Statement\":"
             + "[{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}]}";
 
-    record ManagedPolicyDef(String name, String path, String description) {
+    record ManagedPolicyDef(String name, String path, String description, String document) {
         String arn() {
             return ARN_PREFIX + path + name;
+        }
+
+        /** The real document when the catalog carries one, otherwise the shared placeholder. */
+        String resolvedDocument() {
+            return document != null ? document : PERMISSIVE_DOCUMENT;
         }
     }
 
@@ -61,7 +53,7 @@ final class AwsManagedPolicies {
                 if (entry.name == null || entry.name.isBlank() || entry.path == null || entry.path.isBlank()) {
                     continue;
                 }
-                defs.add(new ManagedPolicyDef(entry.name, entry.path, entry.description));
+                defs.add(new ManagedPolicyDef(entry.name, entry.path, entry.description, entry.document));
             }
             LOG.debugv("Loaded {0} AWS managed policies from {1}", defs.size(), CATALOG_RESOURCE_NAME);
             return List.copyOf(defs);
@@ -83,5 +75,7 @@ final class AwsManagedPolicies {
         public String name;
         public String path;
         public String description;
+        /** Real AWS policy document JSON, verbatim. Absent for the vast majority of the catalog. */
+        public String document;
     }
 }

@@ -5,8 +5,12 @@
 # keeps that check faithful in both directions: policies AWS publishes attach cleanly, and
 # typos are still rejected.
 #
-# Policy documents are not modelled. Floci does not evaluate IAM by default and every entry
-# resolves to the same permissive document, so only name, path and description are needed.
+# Policy documents are mostly not modelled: an entry with no "document" field resolves to
+# the same permissive placeholder (AwsManagedPolicies.PERMISSIVE_DOCUMENT), so only name,
+# path and description matter for it. A small number of entries below carry a real
+# "document" instead, sourced verbatim from the same iam-dataset export named below, for
+# the managed policies actually attached to our own CDK-generated roles. Those entries let
+# IAM enforcement evaluate them faithfully instead of allowing every action unconditionally.
 #
 # Names and paths derive from the public AWS managed policy list, via
 # https://github.com/iann0036/iam-dataset (MIT). To refresh against a real account:
@@ -845,6 +849,11 @@ policies:
   - name: "AWSLambdaBasicExecutionRole"
     path: "/service-role/"
     description: "Provides write permissions to CloudWatch Logs."
+    # Real AWS document (v1), fetched verbatim from iam-dataset. Attached to the large
+    # majority of our Lambda execution roles; needed for IAM enforcement to mean anything
+    # for them.
+    document: |-
+      {"Statement":[{"Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Effect":"Allow","Resource":"*"}],"Version":"2012-10-17"}
   - name: "AWSLambdaDynamoDBExecutionRole"
     path: "/service-role/"
     description: "Provides list and read access to DynamoDB streams and write permissions to CloudWatch Logs."
@@ -879,6 +888,11 @@ policies:
   - name: "AWSLambdaVPCAccessExecutionRole"
     path: "/service-role/"
     description: "Provides minimum permissions for a Lambda function to execute while accessing a resource within a VPC."
+    # Real AWS document (v3), fetched verbatim from iam-dataset. A single merged statement
+    # covering the same three CloudWatch Logs actions as AWSLambdaBasicExecutionRole plus
+    # the EC2 network-interface actions a VPC-attached function needs.
+    document: |-
+      {"Statement":[{"Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents","ec2:CreateNetworkInterface","ec2:DescribeNetworkInterfaces","ec2:DescribeSubnets","ec2:DeleteNetworkInterface","ec2:AssignPrivateIpAddresses","ec2:UnassignPrivateIpAddresses"],"Effect":"Allow","Resource":"*","Sid":"AWSLambdaVPCAccessExecutionPermissions"}],"Version":"2012-10-17"}
   - name: "AWSLambda_FullAccess"
     path: "/"
   - name: "AWSLambda_ReadOnlyAccess"
