@@ -29,6 +29,9 @@
 
 ---
 
+> [!NOTE]
+> This repository is Enroly's controlled integration fork. Fork contributors should follow the [Enroly integration maintenance guide](docs/enroly-integration.md). General Floci contributions belong in [`floci-io/floci`](https://github.com/floci-io/floci); do not open an upstream pull request for fork work unless explicitly requested.
+
 ## What is Floci?
 
 Floci is a free, open-source local AWS emulator for development, testing, and CI.
