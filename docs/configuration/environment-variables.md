@@ -180,6 +180,7 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_DYNAMODB_ENABLED` | `true` | Enable the DynamoDB service |
+| `FLOCI_SERVICES_DYNAMODB_ITEM_KEY_DELIMITER` | `#` | Exact literal separator used in persisted composite primary-key map entries. The value cannot be empty. |
 
 ### Lambda
 
