@@ -214,7 +214,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
         for (String resource : resources) {
             for (Map<String, List<String>> targetContext : targetContexts) {
-                Decision decision = evaluator.evaluate(caller, null, action, resource, targetContext);
+                Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
+                        targetContext, resource, region, accountId);
+                Decision decision = evaluator.evaluate(caller, null, action, resource, effectiveContext);
                 if (decision != Decision.DENY) {
                     continue;
                 }

@@ -191,9 +191,9 @@ class IamEnforcementFilterTest {
                         "arn:aws:dynamodb:us-east-1:000000000000:table/TableA",
                         "arn:aws:dynamodb:us-east-1:000000000000:table/TableB"
                 ));
-        when(evaluator.evaluate(any(), isNull(), eq("dynamodb:BatchGetItem"), eq("arn:aws:dynamodb:us-east-1:000000000000:table/TableA"), isNull()))
+        when(evaluator.evaluate(any(), isNull(), eq("dynamodb:BatchGetItem"), eq("arn:aws:dynamodb:us-east-1:000000000000:table/TableA"), eq(globalContext(null, "arn:aws:dynamodb:us-east-1:000000000000:table/TableA", "000000000000"))))
                 .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
-        when(evaluator.evaluate(any(), isNull(), eq("dynamodb:BatchGetItem"), eq("arn:aws:dynamodb:us-east-1:000000000000:table/TableB"), isNull()))
+        when(evaluator.evaluate(any(), isNull(), eq("dynamodb:BatchGetItem"), eq("arn:aws:dynamodb:us-east-1:000000000000:table/TableB"), eq(globalContext(null, "arn:aws:dynamodb:us-east-1:000000000000:table/TableB", "000000000000"))))
                 .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
         when(conditionContextResolver.resolve("dynamodb", "dynamodb:BatchGetItem", containerRequest))
                 .thenReturn(null);
@@ -201,8 +201,8 @@ class IamEnforcementFilterTest {
         IamEnforcementFilter filter = newFilter();
         filter.filter(containerRequest);
 
-        verify(evaluator).evaluate(any(), isNull(), eq("dynamodb:BatchGetItem"), eq("arn:aws:dynamodb:us-east-1:000000000000:table/TableA"), isNull());
-        verify(evaluator).evaluate(any(), isNull(), eq("dynamodb:BatchGetItem"), eq("arn:aws:dynamodb:us-east-1:000000000000:table/TableB"), isNull());
+        verify(evaluator).evaluate(any(), isNull(), eq("dynamodb:BatchGetItem"), eq("arn:aws:dynamodb:us-east-1:000000000000:table/TableA"), eq(globalContext(null, "arn:aws:dynamodb:us-east-1:000000000000:table/TableA", "000000000000")));
+        verify(evaluator).evaluate(any(), isNull(), eq("dynamodb:BatchGetItem"), eq("arn:aws:dynamodb:us-east-1:000000000000:table/TableB"), eq(globalContext(null, "arn:aws:dynamodb:us-east-1:000000000000:table/TableB", "000000000000")));
         verify(containerRequest, never()).abortWith(any());
     }
 
@@ -225,9 +225,9 @@ class IamEnforcementFilterTest {
                         "arn:aws:dynamodb:us-east-1:000000000000:table/TableA",
                         "arn:aws:dynamodb:us-east-1:000000000000:table/TableB"
                 ));
-        when(evaluator.evaluate(any(), isNull(), eq("dynamodb:BatchGetItem"), eq("arn:aws:dynamodb:us-east-1:000000000000:table/TableA"), isNull()))
+        when(evaluator.evaluate(any(), isNull(), eq("dynamodb:BatchGetItem"), eq("arn:aws:dynamodb:us-east-1:000000000000:table/TableA"), eq(globalContext(null, "arn:aws:dynamodb:us-east-1:000000000000:table/TableA", "000000000000"))))
                 .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
-        when(evaluator.evaluate(any(), isNull(), eq("dynamodb:BatchGetItem"), eq("arn:aws:dynamodb:us-east-1:000000000000:table/TableB"), isNull()))
+        when(evaluator.evaluate(any(), isNull(), eq("dynamodb:BatchGetItem"), eq("arn:aws:dynamodb:us-east-1:000000000000:table/TableB"), eq(globalContext(null, "arn:aws:dynamodb:us-east-1:000000000000:table/TableB", "000000000000"))))
                 .thenReturn(IamPolicyEvaluator.Decision.DENY);
         when(conditionContextResolver.resolve("dynamodb", "dynamodb:BatchGetItem", containerRequest))
                 .thenReturn(null);
@@ -278,12 +278,12 @@ class IamEnforcementFilterTest {
                         ]}""")));
         when(conditionContextResolver.resolve("ec2", "ec2:TerminateInstances", containerRequest))
                 .thenReturn(conditions);
-        when(evaluator.evaluate(any(), isNull(), eq("ec2:TerminateInstances"), eq("*"), eq(conditions)))
+        when(evaluator.evaluate(any(), isNull(), eq("ec2:TerminateInstances"), eq("*"), eq(globalContext(conditions, "*", "222233334444"))))
                 .thenReturn(IamPolicyEvaluator.Decision.DENY);
 
         newFilter().filter(containerRequest);
 
-        verify(evaluator).evaluate(any(), isNull(), eq("ec2:TerminateInstances"), eq("*"), eq(conditions));
+        verify(evaluator).evaluate(any(), isNull(), eq("ec2:TerminateInstances"), eq("*"), eq(globalContext(conditions, "*", "222233334444")));
         verify(containerRequest).abortWith(any(Response.class));
     }
 
@@ -293,14 +293,14 @@ class IamEnforcementFilterTest {
         Map<String, List<String>> first = Map.of("aws:ResourceTag/Team", List.of("payments"));
         Map<String, List<String>> second = Map.of("aws:ResourceTag/Team", List.of("engineering"));
         stubTaggedTerminate(containerRequest, first, List.of(second));
-        when(evaluator.evaluate(any(), isNull(), eq("ec2:TerminateInstances"), eq("*"), eq(first)))
+        when(evaluator.evaluate(any(), isNull(), eq("ec2:TerminateInstances"), eq("*"), eq(globalContext(first, "*", "222233334444"))))
                 .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
-        when(evaluator.evaluate(any(), isNull(), eq("ec2:TerminateInstances"), eq("*"), eq(second)))
+        when(evaluator.evaluate(any(), isNull(), eq("ec2:TerminateInstances"), eq("*"), eq(globalContext(second, "*", "222233334444"))))
                 .thenReturn(IamPolicyEvaluator.Decision.DENY);
 
         newFilter().filter(containerRequest);
 
-        verify(evaluator).evaluate(any(), isNull(), eq("ec2:TerminateInstances"), eq("*"), eq(second));
+        verify(evaluator).evaluate(any(), isNull(), eq("ec2:TerminateInstances"), eq("*"), eq(globalContext(second, "*", "222233334444")));
         verify(containerRequest).abortWith(any(Response.class));
     }
 
@@ -318,6 +318,12 @@ class IamEnforcementFilterTest {
         verify(evaluator, org.mockito.Mockito.times(2))
                 .evaluate(any(), isNull(), eq("ec2:TerminateInstances"), eq("*"), any());
         verify(containerRequest, never()).abortWith(any());
+    }
+
+    private static Map<String, List<String>> globalContext(Map<String, List<String>> serviceContext,
+                                                            String resourceArn, String accountId) {
+        return IamConditionContextResolver.withGlobalContext(
+                serviceContext, resourceArn, "us-east-1", accountId);
     }
 
     private void stubTaggedTerminate(ContainerRequestContext containerRequest,
@@ -364,7 +370,8 @@ class IamEnforcementFilterTest {
                 .thenReturn(List.of("arn:aws:s3:::bucket"));
         when(conditionContextResolver.resolve("s3", "s3:ListBucket", containerRequest))
                 .thenReturn(conditions);
-        when(evaluator.evaluate(any(), isNull(), eq("s3:ListBucket"), eq("arn:aws:s3:::bucket"), eq(conditions)))
+        when(evaluator.evaluate(any(), isNull(), eq("s3:ListBucket"), eq("arn:aws:s3:::bucket"),
+                eq(globalContext(conditions, "arn:aws:s3:::bucket", "222233334444"))))
                 .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
 
         IamEnforcementFilter filter = newFilter();
@@ -372,7 +379,8 @@ class IamEnforcementFilterTest {
         filter.filter(containerRequest);
 
         verify(evaluator).evaluate(any(), isNull(), eq("s3:ListBucket"),
-                eq("arn:aws:s3:::bucket"), eq(conditions));
+                eq("arn:aws:s3:::bucket"),
+                eq(globalContext(conditions, "arn:aws:s3:::bucket", "222233334444")));
     }
 
     @Test
