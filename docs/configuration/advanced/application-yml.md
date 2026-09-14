@@ -66,7 +66,7 @@ floci:
       lambda:
         flush-interval-ms: 5000
       cloudwatchlogs:
-        flush-interval-ms: 5000
+        flush-interval-ms: 15000
       cloudwatchmetrics:
         flush-interval-ms: 5000
       secretsmanager:
@@ -200,6 +200,7 @@ floci:
     cloudwatchlogs:
       enabled: true
       max-events-per-query: 10000
+      max-stored-events: 20000   # oldest events are evicted once the store exceeds this
 
     cloudwatchmetrics:
       enabled: true
