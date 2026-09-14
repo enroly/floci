@@ -200,7 +200,7 @@ floci:
     cloudwatchlogs:
       enabled: true
       max-events-per-query: 10000
-      max-stored-events: 20000   # oldest events are evicted once the store exceeds this
+      max-stored-events: 20000   # per account; oldest events are evicted once the store exceeds this
 
     cloudwatchmetrics:
       enabled: true
