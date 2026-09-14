@@ -8,7 +8,7 @@ COPY pom.xml .
 RUN mvn dependency:go-offline -q
 
 COPY src/ src/
-RUN mvn clean package -DskipTests -q
+RUN mvn clean package -Dmaven.test.skip=true -q
 
 # Stage 2: Runtime
 FROM eclipse-temurin:25-jre-noble
