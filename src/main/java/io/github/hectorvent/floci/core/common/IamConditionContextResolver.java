@@ -81,6 +81,36 @@ public class IamConditionContextResolver {
         };
     }
 
+    public static Map<String, List<String>> withGlobalContext(Map<String, List<String>> serviceContext,
+                                                        String resourceArn, String region,
+                                                        String accountId) {
+        Map<String, List<String>> conditions = serviceContext == null
+                ? new LinkedHashMap<>()
+                : new LinkedHashMap<>(serviceContext);
+        String resourceAccount = accountFromArn(resourceArn);
+        if (resourceAccount == null || resourceAccount.isBlank()) {
+            resourceAccount = accountId;
+        }
+        putIfPresent(conditions, "aws:ResourceAccount", resourceAccount);
+        putIfPresent(conditions, "aws:PrincipalAccount", accountId);
+        putIfPresent(conditions, "aws:RequestedRegion", region);
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    private static String accountFromArn(String arn) {
+        if (arn == null || !arn.startsWith("arn:")) {
+            return null;
+        }
+        String[] segments = arn.split(":", 6);
+        return segments.length > 4 ? segments[4] : null;
+    }
+
+    private static void putIfPresent(Map<String, List<String>> conditions, String key, String value) {
+        if (value != null && !value.isBlank()) {
+            conditions.put(key, List.of(value));
+        }
+    }
+
     // ── S3 ──────────────────────────────────────────────────────────────────────
 
     private Map<String, List<String>> s3ConditionContext(String action, ContainerRequestContext ctx) {

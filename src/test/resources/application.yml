@@ -124,6 +124,7 @@ floci:
       global-bucket-namespace: false
     dynamodb:
       enabled: true
+      item-key-delimiter: "#"
     sns:
       enabled: true
     lambda:

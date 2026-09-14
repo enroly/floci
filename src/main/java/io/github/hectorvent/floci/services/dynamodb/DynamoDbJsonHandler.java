@@ -1218,13 +1218,12 @@ public class DynamoDbJsonHandler {
 
         for (Map.Entry<String, List<JsonNode>> entry : items.entrySet()) {
             TableDefinition bwTable = dynamoDbService.describeTable(entry.getKey(), region);
-            Set<String> seen = new HashSet<>();
+            Set<DynamoDbItemKey.LogicalIdentity> seen = new HashSet<>();
             for (JsonNode writeReq : entry.getValue()) {
                 JsonNode keyNode = writeReq.has("PutRequest")
                         ? writeReq.get("PutRequest").get("Item")
                         : writeReq.get("DeleteRequest").get("Key");
-                String key = dynamoDbService.buildItemKey(bwTable, keyNode,
-                        DynamoDbService.KeySurface.BATCH_WRITE);
+                DynamoDbItemKey.LogicalIdentity key = dynamoDbService.buildItemIdentity(bwTable, keyNode);
                 if (!seen.add(key)) {
                     throw new AwsException("ValidationException",
                             "Provided list of item keys contains duplicates", 400);
@@ -1308,9 +1307,9 @@ public class DynamoDbJsonHandler {
             TableDefinition bgTable = dynamoDbService.describeTable(entry.getKey(), region);
             JsonNode keys = entry.getValue().get("Keys");
             if (keys == null || !keys.isArray()) continue;
-            Set<String> seen = new HashSet<>();
+            Set<DynamoDbItemKey.LogicalIdentity> seen = new HashSet<>();
             for (JsonNode key : keys) {
-                String itemKey = dynamoDbService.buildItemKey(bgTable, key);
+                DynamoDbItemKey.LogicalIdentity itemKey = dynamoDbService.buildItemIdentity(bgTable, key);
                 if (!seen.add(itemKey)) {
                     throw new AwsException("ValidationException",
                             "Provided list of item keys contains duplicates", 400);
@@ -1712,7 +1711,7 @@ public class DynamoDbJsonHandler {
         }
 
         Map<String, TableDefinition> tableCache = new HashMap<>();
-        Set<String> seen = new HashSet<>();
+        Map<String, Set<DynamoDbItemKey.LogicalIdentity>> seen = new HashMap<>();
         for (JsonNode txItem : transactItemsNode) {
             JsonNode op = txItem.has("Put") ? txItem.get("Put")
                         : txItem.has("Delete") ? txItem.get("Delete")
@@ -1724,8 +1723,8 @@ public class DynamoDbJsonHandler {
                     tn -> dynamoDbService.describeTable(tn, region));
             JsonNode keyNode = op.has("Item") ? op.get("Item") : op.get("Key");
             if (keyNode == null) continue;
-            String key = region + "::" + opTable + "::" + dynamoDbService.buildItemKey(txTable, keyNode);
-            if (!seen.add(key)) {
+            DynamoDbItemKey.LogicalIdentity key = dynamoDbService.buildItemIdentity(txTable, keyNode);
+            if (!seen.computeIfAbsent(opTable, ignored -> new HashSet<>()).add(key)) {
                 throw new AwsException("ValidationException",
                         "Transaction request cannot include multiple operations on one item", 400);
             }
@@ -1788,7 +1787,7 @@ public class DynamoDbJsonHandler {
         }
 
         Map<String, TableDefinition> tableCache = new HashMap<>();
-        Set<String> seenGet = new HashSet<>();
+        Map<String, Set<DynamoDbItemKey.LogicalIdentity>> seenGet = new HashMap<>();
         for (JsonNode txItem : transactItemsNode) {
             JsonNode get = txItem.has("Get") ? txItem.get("Get") : null;
             if (get == null) continue;
@@ -1798,8 +1797,8 @@ public class DynamoDbJsonHandler {
             JsonNode keyNode = get.get("Key");
             if (keyNode == null) continue;
             try {
-                String key = region + "::" + opTable + "::" + dynamoDbService.buildItemKey(txTable, keyNode);
-                if (!seenGet.add(key)) {
+                DynamoDbItemKey.LogicalIdentity key = dynamoDbService.buildItemIdentity(txTable, keyNode);
+                if (!seenGet.computeIfAbsent(opTable, ignored -> new HashSet<>()).add(key)) {
                     throw new AwsException("ValidationException",
                             "Transaction request cannot include multiple operations on one item", 400);
                 }

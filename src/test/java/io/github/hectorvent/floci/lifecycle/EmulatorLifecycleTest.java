@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.elasticache.proxy.ElastiCacheProxyMan
 import io.github.hectorvent.floci.services.docdb.container.DocDbContainerManager;
 import io.github.hectorvent.floci.services.neptune.container.NeptuneContainerManager;
 import io.github.hectorvent.floci.services.neptune.proxy.NeptuneProxyManager;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import io.github.hectorvent.floci.services.lambda.DynamoDbStreamsEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.KinesisEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.SqsEventSourcePoller;
@@ -58,6 +59,7 @@ class EmulatorLifecycleTest {
     @Mock private EmulatorConfig config;
     @Mock private EmulatorConfig.StorageConfig storageConfig;
     @Mock private EmulatorConfig.ServicesConfig servicesConfig;
+    @Mock private EmulatorConfig.DynamoDbServiceConfig dynamoDbServiceConfig;
     @Mock private EmulatorConfig.Ec2ServiceConfig ec2ServiceConfig;
     @Mock private EmulatorConfig.ElbV2ServiceConfig elbv2ServiceConfig;
     @Mock private EmulatorConfig.ElbServiceConfig elbServiceConfig;
@@ -83,6 +85,7 @@ class EmulatorLifecycleTest {
     @Mock private SqsEventSourcePoller sqsPoller;
     @Mock private KinesisEventSourcePoller kinesisPoller;
     @Mock private DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller;
+    @Mock private DynamoDbService dynamoDbService;
     @Mock private PipesService pipesService;
     @Mock private Ec2MetadataServer ec2MetadataServer;
     @Mock private EcrRegistryManager ecrRegistryManager;
@@ -99,6 +102,9 @@ class EmulatorLifecycleTest {
     @BeforeEach
     void setUp() {
         Mockito.lenient().when(config.services()).thenReturn(servicesConfig);
+        Mockito.lenient().when(servicesConfig.dynamodb()).thenReturn(dynamoDbServiceConfig);
+        Mockito.lenient().when(dynamoDbServiceConfig.enabled()).thenReturn(true);
+        Mockito.lenient().when(dynamoDbServiceConfig.itemKeyDelimiter()).thenReturn("#");
         Mockito.lenient().when(servicesConfig.ec2()).thenReturn(ec2ServiceConfig);
         Mockito.lenient().when(ec2ServiceConfig.enabled()).thenReturn(false);
         Mockito.lenient().when(servicesConfig.elbv2()).thenReturn(elbv2ServiceConfig);
@@ -119,7 +125,7 @@ class EmulatorLifecycleTest {
                 memoryDbContainerManager, memoryDbProxyManager,
                 docDbContainerManager, neptuneContainerManager, neptuneProxyManager,
                 rabbitMqManager, flinkContainerManager, rdsService, elbV2Service, elbClassicService,
-                initializationHooksRunner, sqsPoller, kinesisPoller, dynamodbStreamsPoller,
+                initializationHooksRunner, sqsPoller, kinesisPoller, dynamodbStreamsPoller, dynamoDbService,
                 pipesService, ec2MetadataServer, ecrRegistryManager, flociUiManager, initLifecycleState,
                 schemaCreationWorker, stepFunctionsService, containerTeardowns, persistentPathValidator);
         Mockito.lenient().when(containerTeardowns.iterator())
@@ -148,6 +154,48 @@ class EmulatorLifecycleTest {
         inOrder.verify(storageFactory).loadAll();
         inOrder.verify(iamService).sweepOrphanedLambdaExecutionRoleSessions();
         inOrder.verify(rdsService).restorePersistedRuntime();
+    }
+
+    @Test
+    void restoresDynamoDbItemsAfterTheFinalStorageLoadBeforeStartingConsumers() throws IOException, InterruptedException {
+        stubStorageConfig();
+        when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(false);
+        when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
+
+        emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
+
+        var inOrder = Mockito.inOrder(storageFactory, dynamoDbService, sqsPoller, kinesisPoller,
+                dynamodbStreamsPoller, pipesService);
+        inOrder.verify(storageFactory).loadAll();
+        inOrder.verify(dynamoDbService).loadPersistedItems();
+        inOrder.verify(sqsPoller).startPersistedPollers();
+        inOrder.verify(kinesisPoller).startPersistedPollers();
+        inOrder.verify(dynamodbStreamsPoller).startPersistedPollers();
+        inOrder.verify(pipesService).startPersistedPollers();
+    }
+
+    @Test
+    void doesNotRestoreDynamoDbItemsWhenTheServiceIsDisabled() throws IOException, InterruptedException {
+        stubStorageConfig();
+        when(dynamoDbServiceConfig.enabled()).thenReturn(false);
+        when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(false);
+        when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
+
+        emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
+
+        verify(dynamoDbService, never()).loadPersistedItems();
+    }
+
+    @Test
+    void rejectsAnEmptyDynamoDbItemKeyDelimiterBeforeStorageLoadsWhenDynamoDbIsDisabled() {
+        stubStorageConfig();
+        Mockito.lenient().when(dynamoDbServiceConfig.enabled()).thenReturn(false);
+        when(dynamoDbServiceConfig.itemKeyDelimiter()).thenReturn("");
+
+        assertThrows(IllegalArgumentException.class, () -> emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class)));
+
+        verify(storageFactory, never()).loadAll();
+        verify(dynamoDbService, never()).loadPersistedItems();
     }
 
     @Test
