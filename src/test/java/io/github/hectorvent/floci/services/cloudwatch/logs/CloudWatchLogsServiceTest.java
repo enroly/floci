@@ -168,6 +168,89 @@ class CloudWatchLogsServiceTest {
         assertNull(group.getRetentionInDays());
     }
 
+    // ──────────────────────────── Stored event ceiling ────────────────────────────
+
+    private static CloudWatchLogsService serviceWithStoredEventCeiling(int maxStoredEvents) {
+        return new CloudWatchLogsService(
+                new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
+                10000,
+                maxStoredEvents,
+                new RegionResolver("us-east-1", "000000000000")
+        );
+    }
+
+    private static List<Map<String, Object>> eventsAt(long... timestamps) {
+        List<Map<String, Object>> events = new ArrayList<>();
+        for (long timestamp : timestamps) {
+            events.add(Map.of("timestamp", timestamp, "message", "event@" + timestamp));
+        }
+        return events;
+    }
+
+    private static List<Long> storedTimestamps(CloudWatchLogsService target, String group, String stream) {
+        return target.getLogEvents(group, stream, null, null, 100, true, null, REGION).events().stream()
+                .map(LogEvent::getTimestamp)
+                .toList();
+    }
+
+    @Test
+    void putLogEventsEvictsTheOldestEventsBeyondTheStoredEventCeiling() {
+        CloudWatchLogsService capped = serviceWithStoredEventCeiling(3);
+        capped.createLogGroup("/app/logs", null, null, REGION);
+        capped.createLogStream("/app/logs", "stream-1", REGION);
+        capped.createLogStream("/app/logs", "stream-2", REGION);
+
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(1000, 2000, 3000), REGION);
+        capped.putLogEvents("/app/logs", "stream-2", eventsAt(4000, 5000), REGION);
+
+        assertEquals(List.of(3000L), storedTimestamps(capped, "/app/logs", "stream-1"),
+                "the oldest events across every stream go first, the store stays within the ceiling");
+        assertEquals(List.of(4000L, 5000L), storedTimestamps(capped, "/app/logs", "stream-2"));
+    }
+
+    @Test
+    void putLogEventsKeepsEverythingWhileUnderTheStoredEventCeiling() {
+        CloudWatchLogsService capped = serviceWithStoredEventCeiling(3);
+        capped.createLogGroup("/app/logs", null, null, REGION);
+        capped.createLogStream("/app/logs", "stream-1", REGION);
+
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(1000, 2000, 3000), REGION);
+
+        assertEquals(List.of(1000L, 2000L, 3000L), storedTimestamps(capped, "/app/logs", "stream-1"));
+    }
+
+    @Test
+    void putLogEventsDropsEventsOlderThanTheGroupRetentionPolicy() {
+        service.createLogGroup("/app/logs", 1, null, REGION);
+        service.createLogStream("/app/logs", "stream-1", REGION);
+        long now = System.currentTimeMillis();
+        long twoDaysAgo = now - 2 * 86_400_000L;
+
+        service.putLogEvents("/app/logs", "stream-1", eventsAt(twoDaysAgo, now), REGION);
+
+        assertEquals(List.of(now), storedTimestamps(service, "/app/logs", "stream-1"),
+                "events past the retention window are not kept on disk waiting for a background sweep");
+    }
+
+    @Test
+    void putLogEventsLeavesOtherGroupsAloneWhenApplyingRetention() {
+        service.createLogGroup("/short", 1, null, REGION);
+        service.createLogStream("/short", "stream-1", REGION);
+        service.createLogGroup("/forever", null, null, REGION);
+        service.createLogStream("/forever", "stream-1", REGION);
+        long now = System.currentTimeMillis();
+        long twoDaysAgo = now - 2 * 86_400_000L;
+
+        service.putLogEvents("/forever", "stream-1", eventsAt(twoDaysAgo), REGION);
+        service.putLogEvents("/short", "stream-1", eventsAt(twoDaysAgo), REGION);
+
+        assertEquals(List.of(twoDaysAgo), storedTimestamps(service, "/forever", "stream-1"));
+        assertEquals(List.of(), storedTimestamps(service, "/short", "stream-1"));
+    }
+
     // ──────────────────────────── KMS key association ────────────────────────────
 
     @Test
