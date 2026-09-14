@@ -488,6 +488,28 @@ class IamConditionContextResolverTest {
                 formRequest("Action=TerminateInstances&InstanceId.1=i-denied&InstanceId.1=i-allowed")));
     }
 
+    @Test
+    void globalKeysArePopulatedForEveryServiceAndAction() {
+        Map<String, List<String>> conditions = IamConditionContextResolver.withGlobalContext(
+                null, "arn:aws:lambda:eu-west-2:000000000000:function:task", "eu-west-2",
+                "000000000000");
+
+        assertEquals(List.of("000000000000"), conditions.get("aws:ResourceAccount"));
+        assertEquals(List.of("000000000000"), conditions.get("aws:PrincipalAccount"));
+        assertEquals(List.of("eu-west-2"), conditions.get("aws:RequestedRegion"));
+    }
+
+    @Test
+    void resourceAccountComesFromTheResourceArnWhenItCarriesOne() {
+        Map<String, List<String>> conditions = IamConditionContextResolver.withGlobalContext(
+                Map.of("service:key", List.of("value")),
+                "arn:aws:sqs:eu-west-2:111111111111:queue", "eu-west-2", "000000000000");
+
+        assertEquals(List.of("111111111111"), conditions.get("aws:ResourceAccount"));
+        assertEquals(List.of("value"), conditions.get("service:key"));
+        assertFalse(conditions.containsKey("aws:SecureTransport"));
+    }
+
     private Decision decisionForEveryTarget(String policy, String action, ContainerRequestContext request) {
         Decision first = evaluator.simulateCustomPolicy(List.of(policy), action, "*",
                 resolver.resolve("ec2", action, request));
