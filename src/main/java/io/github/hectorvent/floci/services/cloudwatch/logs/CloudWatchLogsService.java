@@ -628,6 +628,11 @@ public class CloudWatchLogsService implements ResourceProvider {
      * The store is persisted as a single document rewritten in full on each flush, so its size
      * is the cost of every flush; without a ceiling a chatty function turns log ingestion into a
      * sustained disk writer.
+     * <p>
+     * The ceiling is best-effort rather than atomic: this method is not synchronized, so two
+     * concurrent PutLogEvents calls for the same account can each scan and evict independently and
+     * briefly overshoot the cap. The next ingest corrects the drift, which mirrors how CloudWatch
+     * Logs itself deletes expired events lazily rather than at an exact boundary.
      */
     private void evictEventsBeyondCapacity(String accountId) {
         List<String> keys = List.copyOf(keysForAccount(eventStore, accountId));
