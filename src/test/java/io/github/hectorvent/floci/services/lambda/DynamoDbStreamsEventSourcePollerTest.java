@@ -1162,6 +1162,51 @@ class DynamoDbStreamsEventSourcePollerTest {
     }
 
     @Test
+    void batchOlderThan24HoursWithUnlimitedMaximumRecordAgeIsRetried() throws Exception {
+        EventSourceMapping esm = filterEsm();
+        esm.setMaximumRecordAgeInSeconds(-1);
+
+        assertOldBatchIsRetriedWithoutAnAgeCutoff(esm);
+    }
+
+    @Test
+    void batchOlderThan24HoursWithUnsetMaximumRecordAgeIsRetried() throws Exception {
+        EventSourceMapping esm = filterEsm();
+
+        assertOldBatchIsRetriedWithoutAnAgeCutoff(esm);
+    }
+
+    private void assertOldBatchIsRetriedWithoutAnAgeCutoff(EventSourceMapping esm) throws Exception {
+        DynamoDbStreamRecord record = ddbRecord("s1", "INSERT", "{\"status\":{\"S\":\"active\"}}");
+        record.setApproximateCreationDateTime(clock.get() / 1_000 - 86_401);
+        stubTrimHorizon(List.of(record));
+        InvokeResult error = new InvokeResult();
+        error.setFunctionError("Unhandled");
+        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(error);
+
+        EventSourceMapping.OnFailure onFailure = new EventSourceMapping.OnFailure();
+        onFailure.setDestination("arn:aws:sqs:us-east-1:000000000000:my-dlq");
+        EventSourceMapping.DestinationConfig destinationConfig = new EventSourceMapping.DestinationConfig();
+        destinationConfig.setOnFailure(onFailure);
+        esm.setDestinationConfig(destinationConfig);
+
+        EsmStore store = mock(EsmStore.class);
+        DynamoDbStreamsEventSourcePoller p = pollerWith(store);
+
+        p.pollAndInvoke(esm);
+        awaitPollCompleted(p);
+
+        verify(store, never()).saveForAccount(anyString(), any());
+        verify(sqsService, never()).sendMessage(anyString(), anyString(), anyInt(), anyString());
+
+        advancePastRetry(p);
+        p.pollAndInvoke(esm);
+        verify(executorService, timeout(2000).times(2))
+                .invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse));
+    }
+
+    @Test
     void batchOlderThanMaximumRecordAgeIsDiscardedAndDeliveredToOnFailure() throws Exception {
         DynamoDbStreamRecord record = ddbRecord("s1", "INSERT", "{\"status\":{\"S\":\"active\"}}");
         record.setApproximateCreationDateTime(clock.get() / 1_000 - 61);

@@ -53,7 +53,6 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
     /** Raised by the stream when a stored checkpoint has aged out of the retained window. */
     private static final String TRIMMED_DATA_ACCESS_EXCEPTION = "TrimmedDataAccessException";
     static final long MAX_RETRY_BACKOFF_MS = 60_000;
-    static final long DEFAULT_MAX_RECORD_AGE_SECONDS = 86_400;
 
     private final Vertx vertx;
     private final DynamoDbStreamService streamService;
@@ -452,6 +451,11 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
 
     private boolean hasExceededMaximumRecordAge(EventSourceMapping esm, List<DynamoDbStreamRecord> records,
                                                 long now) {
+        Integer configuredAge = esm.getMaximumRecordAgeInSeconds();
+        if (configuredAge == null || configuredAge <= 0) {
+            return false;
+        }
+
         long oldestRecordSeconds = records.stream()
                 .mapToLong(DynamoDbStreamRecord::getApproximateCreationDateTime)
                 .filter(seconds -> seconds > 0)
@@ -460,11 +464,7 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
         if (oldestRecordSeconds == 0) {
             return false;
         }
-        Integer configuredAge = esm.getMaximumRecordAgeInSeconds();
-        long maximumAgeSeconds = configuredAge == null || configuredAge < 0
-                ? DEFAULT_MAX_RECORD_AGE_SECONDS
-                : configuredAge;
-        return now - oldestRecordSeconds * 1_000 >= maximumAgeSeconds * 1_000;
+        return now - oldestRecordSeconds * 1_000 >= configuredAge * 1_000L;
     }
 
     long retryBackoffMs(int retries) {
