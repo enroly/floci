@@ -38,7 +38,9 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -229,6 +231,33 @@ class EcrRegistryManagerTest {
         when(containerDetector.isRunningInContainer()).thenReturn(true);
 
         assertEquals("http://" + REGISTRY_NAME + ":5000", manager.httpClient().baseUrl());
+    }
+
+    @Test
+    void freshlyCreatedRegistryStreamsItsCompleteLog() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        manager.ensureStarted();
+
+        verify(logStreamer).attach(eq("container-id"), eq("/aws/ecr/registry"), any(), eq("us-east-1"), eq("ecr:registry"));
+        verify(logStreamer, never()).attachFromNow(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void adoptedRegistryStreamsOnlyNewLinesInsteadOfReplayingItsHistory() {
+        Container existing = Mockito.mock(Container.class);
+        when(existing.getId()).thenReturn("0123456789abcdef");
+        when(lifecycleManager.findByName(REGISTRY_NAME)).thenReturn(Optional.of(existing));
+        when(lifecycleManager.adopt("0123456789abcdef", List.of(5000)))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("0123456789abcdef",
+                        Map.of(5000, new ContainerLifecycleManager.EndpointInfo("172.17.0.5", 5000)),
+                        Map.of(5000, BASE_PORT + 1)));
+
+        manager.ensureStarted();
+
+        verify(logStreamer).attachFromNow(eq("0123456789abcdef"), eq("/aws/ecr/registry"), any(), eq("us-east-1"), eq("ecr:registry"));
+        verify(logStreamer, never()).attach(any(), any(), any(), any(), any());
     }
 
     @Test
