@@ -109,6 +109,74 @@ class CloudWatchLogsServiceTest {
     }
 
     @Test
+    void explicitAccountRetentionEvictionLeavesOtherAccountEventsUntouched() {
+        InMemoryStorage<String, LogGroup> rawGroups = new InMemoryStorage<>();
+        InMemoryStorage<String, LogStream> rawStreams = new InMemoryStorage<>();
+        InMemoryStorage<String, LogEvent> rawEvents = new InMemoryStorage<>();
+        String accountA = "111111111111";
+        String accountB = "222222222222";
+        CloudWatchLogsService accountService = new CloudWatchLogsService(
+                new AccountAwareStorageBackend<>(rawGroups, null, accountB),
+                new AccountAwareStorageBackend<>(rawStreams, null, accountB),
+                new AccountAwareStorageBackend<>(rawEvents, null, accountB),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, accountB),
+                10_000, new RegionResolver(REGION, accountB));
+        long now = System.currentTimeMillis();
+        long twoDaysAgo = now - 2 * 86_400_000L;
+
+        accountService.createLogGroupForAccount(accountA, "/app/logs", 1, null, REGION);
+        accountService.createLogStreamForAccount(accountA, "/app/logs", "stream", REGION);
+        accountService.createLogGroupForAccount(accountB, "/app/logs", null, null, REGION);
+        accountService.createLogStreamForAccount(accountB, "/app/logs", "stream", REGION);
+        accountService.putLogEventsForAccount(
+                accountB, "/app/logs", "stream", eventsAt(twoDaysAgo), REGION);
+        accountService.putLogEventsForAccount(
+                accountA, "/app/logs", "stream", eventsAt(twoDaysAgo, now), REGION);
+
+        String eventPrefix = REGION + "::/app/logs::stream::";
+        assertEquals(1, rawEvents.keys().stream()
+                .filter(key -> key.startsWith(accountA + "/" + eventPrefix))
+                .count());
+        assertEquals(1, rawEvents.keys().stream()
+                .filter(key -> key.startsWith(accountB + "/" + eventPrefix))
+                .count());
+    }
+
+    @Test
+    void explicitAccountCapacityEvictionDoesNotCountOtherAccountEvents() {
+        InMemoryStorage<String, LogGroup> rawGroups = new InMemoryStorage<>();
+        InMemoryStorage<String, LogStream> rawStreams = new InMemoryStorage<>();
+        InMemoryStorage<String, LogEvent> rawEvents = new InMemoryStorage<>();
+        String accountA = "111111111111";
+        String accountB = "222222222222";
+        CloudWatchLogsService accountService = new CloudWatchLogsService(
+                new AccountAwareStorageBackend<>(rawGroups, null, accountB),
+                new AccountAwareStorageBackend<>(rawStreams, null, accountB),
+                new AccountAwareStorageBackend<>(rawEvents, null, accountB),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, accountB),
+                10_000, 2, new RegionResolver(REGION, accountB));
+
+        accountService.createLogGroupForAccount(accountA, "/app/logs", null, null, REGION);
+        accountService.createLogStreamForAccount(accountA, "/app/logs", "stream", REGION);
+        for (long timestamp : List.of(1L, 2L, 3L)) {
+            LogEvent event = new LogEvent();
+            event.setTimestamp(timestamp);
+            event.setEventId("event-" + timestamp);
+            rawEvents.put(accountB + "/event-" + timestamp, event);
+        }
+
+        accountService.putLogEventsForAccount(
+                accountA, "/app/logs", "stream", eventsAt(4L), REGION);
+
+        assertEquals(3, rawEvents.keys().stream()
+                .filter(key -> key.startsWith(accountB + "/"))
+                .count());
+        assertEquals(1, rawEvents.keys().stream()
+                .filter(key -> key.startsWith(accountA + "/"))
+                .count());
+    }
+
+    @Test
     void deleteLogGroup() {
         service.createLogGroup("/app/logs", null, null, REGION);
         service.deleteLogGroup("/app/logs", REGION);

@@ -60,7 +60,7 @@ public class CloudWatchLogsService implements ResourceProvider {
     private final StorageBackend<String, ResourcePolicy> resourcePolicyStore;
     private final RegionResolver regionResolver;
     private final int maxEventsPerQuery;
-    /** Ceiling on stored events across every group; the oldest are evicted first once exceeded. */
+    /** Ceiling on stored events across every group in an account; the oldest are evicted first once exceeded. */
     private final int maxStoredEvents;
     /**
      * Monotonic counter assigning an ingestion sequence to each stored event. Seeded from
@@ -577,7 +577,7 @@ public class CloudWatchLogsService implements ResourceProvider {
         }
 
         evictEventsPastRetention(accountId, region, groupName, now);
-        evictEventsBeyondCapacity();
+        evictEventsBeyondCapacity(accountId);
 
         // Update stream metadata
         if (minTs != null) {
@@ -611,36 +611,37 @@ public class CloudWatchLogsService implements ResourceProvider {
         }
         long cutoff = now - retentionInDays * 86_400_000L;
         String groupPrefix = region + "::" + groupName + "::";
-        for (String key : List.copyOf(eventStore.keys())) {
+        for (String key : List.copyOf(keysForAccount(eventStore, accountId))) {
             if (!key.startsWith(groupPrefix)) {
                 continue;
             }
-            boolean expired = eventStore.get(key).map(event -> event.getTimestamp() < cutoff).orElse(false);
+            boolean expired = getForAccount(eventStore, accountId, key)
+                    .map(event -> event.getTimestamp() < cutoff).orElse(false);
             if (expired) {
-                eventStore.delete(key);
+                deleteForAccount(eventStore, accountId, key);
             }
         }
     }
 
     /**
-     * Keeps the whole event store under {@link #maxStoredEvents} by dropping the oldest events.
+     * Keeps an account's event store under {@link #maxStoredEvents} by dropping the oldest events.
      * The store is persisted as a single document rewritten in full on each flush, so its size
      * is the cost of every flush; without a ceiling a chatty function turns log ingestion into a
      * sustained disk writer.
      */
-    private void evictEventsBeyondCapacity() {
-        List<String> keys = List.copyOf(eventStore.keys());
+    private void evictEventsBeyondCapacity(String accountId) {
+        List<String> keys = List.copyOf(keysForAccount(eventStore, accountId));
         int excess = keys.size() - maxStoredEvents;
         if (excess <= 0) {
             return;
         }
         List<Map.Entry<String, LogEvent>> oldestFirst = new ArrayList<>(keys.size());
         for (String key : keys) {
-            eventStore.get(key).ifPresent(event -> oldestFirst.add(Map.entry(key, event)));
+            getForAccount(eventStore, accountId, key).ifPresent(event -> oldestFirst.add(Map.entry(key, event)));
         }
         oldestFirst.sort(Map.Entry.comparingByValue(EVENT_ORDER));
         for (Map.Entry<String, LogEvent> entry : oldestFirst.subList(0, Math.min(excess, oldestFirst.size()))) {
-            eventStore.delete(entry.getKey());
+            deleteForAccount(eventStore, accountId, entry.getKey());
         }
         LOG.debugv("Evicted {0} oldest log event(s) to stay within the {1}-event store ceiling", excess, maxStoredEvents);
     }
@@ -664,6 +665,25 @@ public class CloudWatchLogsService implements ResourceProvider {
             return;
         }
         store.put(key, value);
+    }
+
+    private <V> Set<String> keysForAccount(StorageBackend<String, V> store, String accountId) {
+        if (accountId != null && store instanceof AccountAwareStorageBackend<?> rawAware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<V> aware = (AccountAwareStorageBackend<V>) rawAware;
+            return aware.keysForAccount(accountId);
+        }
+        return store.keys();
+    }
+
+    private <V> void deleteForAccount(StorageBackend<String, V> store, String accountId, String key) {
+        if (accountId != null && store instanceof AccountAwareStorageBackend<?> rawAware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<V> aware = (AccountAwareStorageBackend<V>) rawAware;
+            aware.deleteForAccount(accountId, key);
+            return;
+        }
+        store.delete(key);
     }
 
     public record LogEventsResult(List<LogEvent> events, String nextForwardToken, String nextBackwardToken) {}
