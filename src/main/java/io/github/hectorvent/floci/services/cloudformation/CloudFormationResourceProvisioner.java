@@ -1751,6 +1751,12 @@ public class CloudFormationResourceProvisioner {
 
     // ── IAM Policy ────────────────────────────────────────────────────────────
 
+    private static String resolvePolicyDocument(JsonNode props, CloudFormationTemplateEngine engine) {
+        JsonNode documentNode = props != null ? props.get("PolicyDocument") : null;
+        String resolved = documentNode != null ? engine.resolveJsonAttributeStrict(documentNode) : null;
+        return resolved != null ? resolved : "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+    }
+
     /**
      * Provisions {@code AWS::IAM::Policy}, which in AWS is an <em>inline</em> policy embedded in the
      * named roles/users/groups (equivalent to PutRolePolicy/PutUserPolicy/PutGroupPolicy) — <em>not</em>
@@ -1773,9 +1779,7 @@ public class CloudFormationResourceProvisioner {
                     ? previousPolicyName
                     : generatePhysicalName(stackName, r.getLogicalId(), 128, false);
         }
-        String document = props != null && props.has("PolicyDocument")
-                ? props.get("PolicyDocument").toString()
-                : "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+        String document = resolvePolicyDocument(props, engine);
 
         final String name = policyName;
         final String doc = document;
@@ -1932,9 +1936,7 @@ public class CloudFormationResourceProvisioner {
         if (policyName == null || policyName.isBlank()) {
             policyName = generatePhysicalName(stackName, r.getLogicalId(), 128, false);
         }
-        String document = props != null && props.has("PolicyDocument")
-                ? props.get("PolicyDocument").toString()
-                : "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+        String document = resolvePolicyDocument(props, engine);
         List<String> roleNames = resolveStringList(props, "Roles", engine);
         String existingArn = r.getPhysicalId();
 
