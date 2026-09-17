@@ -21,7 +21,7 @@
         <jackson.version>2.18.8</jackson.version>
         <kafka.clients.version>3.9.2</kafka.clients.version>
         <netty.version>4.1.135.Final</netty.version>
-        <wire.version>6.3.0</wire.version>
+        <wire.version>6.4.5</wire.version>
     </properties>
 
     <dependencyManagement>
