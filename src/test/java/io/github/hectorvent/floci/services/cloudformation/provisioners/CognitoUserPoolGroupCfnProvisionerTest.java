@@ -22,6 +22,7 @@ import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -35,12 +36,20 @@ class CognitoUserPoolGroupCfnProvisionerTest {
     private final ObjectMapper mapper = new ObjectMapper();
 
     private ProvisionContext ctx() {
+        return ctx(null);
+    }
+
+    /**
+     * CloudFormation hands a provisioner the prior physical id through the context, so an update
+     * has to be modelled there and not only on the resource.
+     */
+    private ProvisionContext ctx(String priorPhysicalId) {
         CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
         when(engine.resolve(any())).thenAnswer(inv -> {
             JsonNode node = inv.getArgument(0);
             return node == null ? null : node.asText();
         });
-        return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack");
+        return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack", priorPhysicalId);
     }
 
     private ObjectNode props(String userPoolId, String groupName) {
@@ -96,12 +105,30 @@ class CognitoUserPoolGroupCfnProvisionerTest {
     }
 
     @Test
+    void anUnnamedGroupKeepsItsGeneratedNameAcrossUpdates() {
+        // GroupName is optional and CloudFormation generates one. Generating a fresh name on every
+        // UpdateStack would create a second group and orphan the first, so the generated name has
+        // to survive the update.
+        StackResource created = resource(null);
+        provisioner.provision(created, props("us-east-1_pool", null), ctx());
+        String generated = created.getPhysicalId();
+
+        StackResource updated = resource(generated);
+        provisioner.provision(updated, props("us-east-1_pool", null), ctx(generated));
+
+        assertEquals(generated, updated.getPhysicalId(),
+                "an unnamed group must keep its generated name across updates");
+        verify(cognito).updateGroup("us-east-1_pool", generated, null, null, null);
+        verify(cognito, times(1)).createGroup(any(), any(), any(), any(), any());
+    }
+
+    @Test
     void reProvisioningTheSameGroupUpdatesInPlace() {
         // UpdateStack re-provisions every resource whether or not its properties changed, so an
         // unchanged group must reconcile rather than call CreateGroup again and fail the stack.
         StackResource r = resource("admin");
 
-        provisioner.provision(r, props("us-east-1_pool", "admin"), ctx());
+        provisioner.provision(r, props("us-east-1_pool", "admin"), ctx("admin"));
 
         verify(cognito).updateGroup("us-east-1_pool", "admin", null, null, null);
         verify(cognito, never()).createGroup(any(), any(), any(), any(), any());
@@ -111,7 +138,7 @@ class CognitoUserPoolGroupCfnProvisionerTest {
     void renamingTheGroupCreatesUnderTheNewName() {
         StackResource r = resource("admin");
 
-        provisioner.provision(r, props("us-east-1_pool", "operators"), ctx());
+        provisioner.provision(r, props("us-east-1_pool", "operators"), ctx("admin"));
 
         verify(cognito).createGroup("us-east-1_pool", "operators", null, null, null);
         assertEquals("operators", r.getPhysicalId());

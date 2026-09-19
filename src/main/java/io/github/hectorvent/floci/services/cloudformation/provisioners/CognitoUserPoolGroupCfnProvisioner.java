@@ -36,17 +36,17 @@ public class CognitoUserPoolGroupCfnProvisioner implements CfnResourceProvisione
         if (userPoolId == null || userPoolId.isBlank()) {
             throw new IllegalArgumentException("UserPoolId is required for AWS::Cognito::UserPoolGroup");
         }
-        String groupName = ctx.resolveOptional(props, "GroupName");
-        if (groupName == null || groupName.isBlank()) {
-            groupName = ctx.generatePhysicalName(r.getLogicalId(), 128, false);
-        }
+        // GroupName is optional, and the generated stand-in has to stay put: generating a fresh one
+        // on each UpdateStack would create a second group and orphan the one the stack already owns.
+        String groupName = ctx.stablePhysicalName(
+                ctx.resolveOptional(props, "GroupName"), r.getLogicalId(), 128, false);
         String description = ctx.resolveOptional(props, "Description");
         Integer precedence = parsePrecedence(ctx.resolveOptional(props, "Precedence"));
         String roleArn = ctx.resolveOptional(props, "RoleArn");
 
         // provision is also the update path. A group is addressed by its name, so a renamed group
         // has nothing to update under the new name: that is a replacement on AWS too.
-        if (groupName.equals(r.getPhysicalId())) {
+        if (ctx.reusesPriorEntity(groupName)) {
             cognitoService.updateGroup(userPoolId, groupName, description, precedence, roleArn);
         } else {
             cognitoService.createGroup(userPoolId, groupName, description, precedence, roleArn);
